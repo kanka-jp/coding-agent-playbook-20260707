@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>スライド | Coding Agent Playbook</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.2.1/dist/reveal.css" integrity="sha384-tK61vs+AeByBmiQ/i6CLgp/PbaaoB/k7M4J5mlX70GVtBPGUk5avjbXhSwhsf3fS" crossorigin="anonymous">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.2.1/dist/theme/white.css" integrity="sha384-flndleNngtsjA21lEvW9JpgOND8agbgm+1EI+KQFbNa0OcOWGydVQbh+G3H2E1dI" crossorigin="anonymous">
+  <style>
+    :root {
+      --r-main-font: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", "Meiryo", sans-serif;
+      --r-heading-font: var(--r-main-font);
+      --accent: #1f6feb;
+    }
+    .reveal { font-family: var(--r-main-font); }
+    .reveal h1, .reveal h2, .reveal h3 { font-family: var(--r-heading-font); color: #0d2b4e; text-transform: none; letter-spacing: 0; }
+    /* 上寄せ: 中身をスライド上端から下へ流す (Google スライド風) */
+    .reveal .slides { text-align: left; }
+    .reveal section { height: 100%; top: 0 !important; padding: 5% 7%; box-sizing: border-box; }
+    .reveal h2 { margin-top: 0; border-bottom: 3px solid var(--accent); padding-bottom: .25em; }
+    .reveal li { margin: .5em 0; line-height: 1.5; }
+    .reveal strong { color: var(--accent); }
+    /* タイトル/セクション扉も上寄せ・左寄せで統一 (中央寄せにしない) */
+    .reveal section.title-slide h1, .reveal section.title-slide h2 { border: none; }
+    .reveal .subtle { color: #5a6b7b; font-size: .7em; }
+  </style>
+</head>
+<body>
+  <div class="reveal">
+    <div class="slides">
+      <section data-markdown data-separator="\r?\n---\r?\n">
+        <textarea data-template>
+<!-- .slide: class="title-slide" -->
+# タイトル
+## Stage NN — サブタイトル
+1 行の説明
+
+---
+
+## 見出し
+
+- 箇条書き
+- 箇条書き
+- 箇条書き
+
+---
+
+<!-- .slide: class="title-slide" -->
+## 次のステージへ
+**Stage NN — ...**
+        </textarea>
+      </section>
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.2.1/dist/reveal.js" integrity="sha384-rZIIVPQD/+U9IL3I62KrBHuVtPgYv+xdXvER5RBiVQRszJEJfLKRrcrZwI7fhcHT" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.2.1/plugin/markdown/markdown.js" integrity="sha384-ee/QmFMUwC+YUuswSDzliKj27Anp3rSblE1ujBcPKyrzwG15Daa1GL6JcNbPg/oG" crossorigin="anonymous"></script>
+  <script>
+    Reveal.initialize({
+      hash: true,
+      center: false,
+      width: 1280,
+      height: 720,
+      margin: 0,
+      slideNumber: "c/t",
+      plugins: [ RevealMarkdown ],
+    });
+  </script>
+</body>
+</html>

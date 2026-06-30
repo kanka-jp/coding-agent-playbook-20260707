@@ -1,0 +1,15 @@
+# TODO: workflow_dispatch only (private repo の課金回避)。public 化時の enable 手順は .github/workflows/README.md 参照
+name: shellcheck
+on:
+  workflow_dispatch:
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck on scripts/**/*.sh
+        # shellcheck は ubuntu-latest に pre-installed (apt 経由でも可)。
+        # scripts/internal/ も対象に含めるため明示的に 2 階層を列挙 (bash の素の glob は recurse しない)。
+        # --severity=warning: SC2016 (info) は sh -lc '$1' のような remote shell への意図的な
+        # 位置パラメータ渡しに対する false-positive なので info level を除外する。
+        run: shellcheck --severity=warning scripts/*.sh scripts/internal/*.sh

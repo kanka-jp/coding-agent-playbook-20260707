@@ -1,0 +1,15 @@
+# TODO: workflow_dispatch only (private repo の課金回避)。public 化時の enable 手順は .github/workflows/README.md 参照
+name: python-syntax
+on:
+  workflow_dispatch:
+jobs:
+  python-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: py_compile a2a-review server
+        # asyncio limit / readline buffer 系の修正で regression を入れないよう CI で syntax を常時 verify
+        run: python -m py_compile tools/a2a-review/codex-a2a-server/server.py
