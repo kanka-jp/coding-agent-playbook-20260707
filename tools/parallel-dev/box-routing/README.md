@@ -1,96 +1,92 @@
-# box ルーティング（sbx box → host → Traefik）
+# Box routing (sbx box → host → Traefik)
 
-> このディレクトリの publish + 経路生成を自動化したのが `scripts/dev.sh route` subcommand（`up` / `add <box> [port] [name]` / `rm <name>` / `ls` / `down` / `detect`、Windows は `scripts/dev.ps1 route`）。以下は**何が起きているか**のリファレンス。
+> This directory's publish + path generation is automated by `scripts/dev.sh route` subcommand (`up` / `add <box> [port] [name]` / `rm <name>` / `ls` / `down` / `detect`; Windows uses `scripts/dev.ps1 route`). What follows is a reference for **what happens**.
 
-sbx box の中で動かす dev server を、host から **Host 名で振り分ける**ための最小リファレンス。
-親ディレクトリの [../README.md](../README.md) は host docker 上の compose stack（docker provider / label）を
-対象にするが、box 内 dev server は **microVM の独自 docker daemon の中**で動き host の `traefik-public`
-network に直結できないため、docker provider では拾えない。そこで box の port を host に publish し、
-Traefik の **file provider** で振り分ける。
+Minimal reference for routing dev servers running inside sbx boxes from the host via **hostname**.
+The parent [../README.md](../README.md) targets compose stacks on host docker (docker provider / label), but dev servers inside boxes run in **the microVM's custom docker daemon** and can't directly connect to the host's `traefik-public` network, so docker provider can't pick them up. Instead, we publish the box's port to the host and use Traefik's **file provider** to route.
 
-## 前提
+## Prerequisites
 
-- **Docker Desktop（macOS / Windows）を想定**。`sbx ports --publish` は host の `127.0.0.1:<port>`（loopback）に出すため、container から到達するのに `host.docker.internal` を使う。Docker Desktop はこれを host の loopback に解決する。
-- **Linux ネイティブ Docker Engine の注意**: `host.docker.internal:host-gateway` は bridge gateway IP（例 `172.17.0.1`）に解決され、`127.0.0.1` のみで listen する publish 先には届かず **502** になる。Linux では publish を全 interface に出す（`sbx ports <box> --publish 0.0.0.0:18001:3000`。`sbx ports` は `[[HOST_IP:]HOST_PORT:]SANDBOX_PORT` 形式で HOST_IP を取れる）と、bridge gateway IP 経由で届くようになる。または proxy を `network_mode: host` で起動して dynamic config の url を `http://127.0.0.1:<port>` にする。
-- **`:80` は親 proxy と共用不可**: この proxy は親 `../proxy.compose.yml`（docker provider）と同じ `:80` を bind する。両者は別シナリオ（docker provider stack か box publish port か）の **代替**で、同時起動はできない。box port をルーティングするときは親 proxy を止めてこちらを使う（または `ports` を `8088:80` 等に変える）。
+- **Docker Desktop (macOS / Windows) assumed**. `sbx ports --publish` publishes to host's `127.0.0.1:<port>` (loopback); containers reach it via `host.docker.internal`. Docker Desktop resolves this to the host's loopback.
+- **Linux native Docker Engine caveat**: `host.docker.internal:host-gateway` resolves to the bridge gateway IP (e.g., `172.17.0.1`), which doesn't reach publish targets listening only on `127.0.0.1`, resulting in **502**. On Linux, publish to all interfaces (` sbx ports <box> --publish 0.0.0.0:18001:3000`; `sbx ports` accepts `[[HOST_IP:]HOST_PORT:]SANDBOX_PORT` format with HOST_IP) so the bridge gateway IP can reach it. Or start the proxy with `network_mode: host` and set dynamic config URL to `http://127.0.0.1:<port>`.
+- **`:80` can't be shared with parent proxy**: This proxy binds the same `:80` as the parent `../proxy.compose.yml` (docker provider). The two are **alternatives** for different scenarios (docker provider stack vs. box publish port), not concurrent. When routing box ports, stop the parent proxy and use this one (or change `ports` to `8088:80`, etc.).
 
-## URL の規約
+## URL convention
 
 ```
 web.<name>.localhost
 ```
 
-- `scripts/dev.sh route add <box>` の `<name>` 既定は **`<branch>.<repo>`**（現 checkout 由来）→ `web.<branch>.<repo>.localhost`。`<name>` を明示すれば任意（ドット区切りの DNS ラベル列を許可）
-- branch / repo で名前空間が分かれるので、複数 box / 複数 stage を並列に立てても URL が衝突しない
-- `*.localhost` は主要ブラウザが標準で loopback に解決するため hosts 編集不要
+- Default `<name>` for `scripts/dev.sh route add <box>` is **`<branch>.<repo>`** (from current checkout) → `web.<branch>.<repo>.localhost`. Explicit `<name>` can be arbitrary (allows dot-separated DNS label sequences)
+- Branch / repo provides namespace separation, so parallel boxes / multiple stages don't collide on URLs
+- `*.localhost` resolves to loopback by default in major browsers, so no hosts file editing needed
 
-## 使い方
+## Usage
 
-以下の §2 / §3 は **このディレクトリを cwd として**実行する（親 README は repo ルート基準のフルパスだが、本手順は相対パス前提）:
+Steps §2 / §3 below are **executed with this directory as cwd** (parent README uses full paths relative to repo root, but this procedure assumes relative paths):
 
 ```bash
 cd tools/parallel-dev/box-routing
 ```
 
-### 1. box の port を host に publish
+### 1. Publish box's port to host
 
 ```bash
-sbx ports <box> --publish 18001:3000   # box の web(3000) を host:18001 に出す
+sbx ports <box> --publish 18001:3000   # expose box's web(3000) to host:18001
 ```
 
-### 2. dynamic config を置く
+### 2. Place dynamic config
 
-`boxes.example.yml` を `dynamic/` にコピーし、box 名と publish した host port に書き換える:
+Copy `boxes.example.yml` to `dynamic/`, editing box name and published host port:
 
 ```bash
 cp boxes.example.yml dynamic/box1.yml
-# dynamic/box1.yml の Host(...) と host.docker.internal:<port> を編集
+# edit Host(...) and host.docker.internal:<port> in dynamic/box1.yml
 ```
 
-box を増やすときは router + service のペアを足す（または box ごとに 1 ファイル）。
+To add boxes, add router + service pairs (or one file per box).
 
-### 3. プロキシを起動
+### 3. Start the proxy
 
 ```bash
 docker compose -f proxy.compose.yml up -d
 ```
 
-→ `http://web.<box>.localhost` をブラウザで開く。`dynamic/` は watch されているので、
-publish と dynamic config の追加だけで box を増やせる（プロキシ再起動不要）。
+→ Open `http://web.<box>.localhost` in your browser. The `dynamic/` dir is watched, so you can add boxes with just publish + dynamic config addition (no proxy restart needed).
 
-### 片付け
+### Cleanup
 
 ```bash
 docker compose -f proxy.compose.yml down
 sbx ports <box> --unpublish 18001:3000
 ```
 
-## モード（baseline / 自前 Traefik / 既存の共有 Traefik に相乗り）
+## Modes (baseline / own Traefik / piggyback on existing shared Traefik)
 
-ルーティングは**オプション層**で、3 通りある。`scripts/dev.sh route` subcommand は後者2つを扱う。
+Routing is an **optional layer** with 3 variants. `scripts/dev.sh route` subcommand handles the latter two.
 
-1. **baseline（Traefik なし）**: 名前付き URL が要らないなら Traefik は不要。`sbx ports <box> --publish <port>:<port>` で `http://localhost:<port>` を直接開く。**最も単純で全員が使える**。
-2. **自前 Traefik（既定・`dev.sh route up`）**: `:80` が空いていて名前付き URL が欲しい場合。本ディレクトリの proxy を立て、`web.<name>.localhost` で見る。
-3. **既存の共有 Traefik に相乗り（自動検出）**: ホストに既に Traefik が `:80` で居る場合（複数 project を 1 本で捌くのが定石）。`:80` は 1 本しか bind できないので自前は立てず、**その Traefik の file provider 供給先へ経路を出し入れ**する。`dev.sh route` が **:80 の file-provider Traefik を自動検出**するので env 指定なしで使える:
-
-   ```bash
-   bash scripts/dev.sh route add <box>   # :80 の共有 Traefik を自動検出して相乗り（up 不要）
-   bash scripts/dev.sh route detect      # 検出結果（供給先 volume/dir）を確認
-   ```
-
-   検出: `docker ps` で `:80` を publish する image 名に `traefik` を含む container を探し、CLI 引数 `--providers.file.directory=<dir>` と、その dir を destination に持つ mount（named volume / bind source）を引く。**config file で file provider を設定した Traefik 等、自動検出できない構成**は env で供給先を明示:
+1. **Baseline (no Traefik)**: If named URLs aren't needed, Traefik is unnecessary. Publish directly with `sbx ports <box> --publish <port>:<port>` and open `http://localhost:<port>`. **Simplest, works for everyone**.
+2. **Own Traefik (default, `dev.sh route up`)**: If `:80` is available and you want named URLs. Start the proxy in this directory and view via `web.<name>.localhost`.
+3. **Piggyback on existing shared Traefik (auto-detect)**: If Traefik already runs on host's `:80` (common for multiple projects under one). `:80` can only bind once, so don't start your own; instead **feed routes to that Traefik's file provider destination**. `dev.sh route` **auto-detects :80's file-provider Traefik**, so use without env vars:
 
    ```bash
-   BOX_ROUTING_DYNAMIC_DIR=<dir>    bash scripts/dev.sh route add <box>   # bind dir watch
-   BOX_ROUTING_DYNAMIC_VOLUME=<vol> bash scripts/dev.sh route add <box>   # named volume watch
+   bash scripts/dev.sh route add <box>   # auto-detect :80's shared Traefik and piggyback (no up needed)
+   bash scripts/dev.sh route detect      # check detection result (destination volume/dir)
    ```
 
-   相乗り時は `up`/`down` が no-op（共有 Traefik は管理しない）、`add`/`rm`/`ls` だけが供給先を操作（共有 Traefik 側の設定変更は不要）。複数 project で供給先を共有するため `<name>` はグローバルに一意に（既定 `<branch>.<repo>` は repo を含み衝突しにくい）。`rm` は `# box` marker 付き（本 subcommand 由来）のみ削除し手書き config を誤って消さない。
+   Detection: Search `docker ps` for containers with `traefik` in their image name publishing `:80`; read CLI arg `--providers.file.directory=<dir>` and find the mount (named volume / bind source) with that dir as destination. For **Traefik configured with file provider in config file or other auto-detect-incompatible setups**, explicitly specify destination via env:
 
-## 親リファレンスとの使い分け
+   ```bash
+   BOX_ROUTING_DYNAMIC_DIR=<dir>    bash scripts/dev.sh route add <box>   # watch bind dir
+   BOX_ROUTING_DYNAMIC_VOLUME=<vol> bash scripts/dev.sh route add <box>   # watch named volume
+   ```
 
-| | [../](../README.md)（docker provider） | 本ディレクトリ（file provider） |
+   When piggybacking, `up`/`down` are no-ops (don't manage shared Traefik); only `add`/`rm`/`ls` manipulate the destination (no shared Traefik reconfiguration needed). Since multiple projects share the destination, `<name>` must be globally unique (default `<branch>.<repo>` includes repo, collision-resistant). `rm` only deletes entries with `# box` marker (this subcommand's signature) and won't accidentally erase hand-written config.
+
+## Differentiation from parent reference
+
+| | [../](../README.md) (docker provider) | This directory (file provider) |
 |---|---|---|
-| ルーティング対象 | host docker 上の compose stack（label で自動検出） | sbx box が host に publish した loopback port |
-| port | container port を Traefik が docker network 経由で参照 | `sbx ports --publish` の host port を `host.docker.internal` 経由で参照 |
-| 用途 | host で直接立てる並列 dev | box-primary（YOLO 隔離）で立てる並列 dev |
+| Routing target | compose stacks on host docker (auto-detected via labels) | loopback ports sbx boxes publish to host |
+| Port reference | Traefik reads container port via docker network | Traefik reads host port from `sbx ports --publish` via `host.docker.internal` |
+| Use case | parallel dev on host directly | parallel dev on box-primary (YOLO isolation) |

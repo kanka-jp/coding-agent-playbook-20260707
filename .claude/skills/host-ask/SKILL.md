@@ -5,54 +5,54 @@ description: "From inside an sbx box, write a structured request file under `.cl
 
 # host-ask
 
-box 内 (sbx microVM) で動いている claude session が、box からは見えない host 側の事実 (他 compose project の状態 / host で listen 中の port の占有者 / mount 外の host filesystem / box の network 制限で到達不能な host-local service) を必要としたとき、`.claude/host-bridge/ask-<box-name>-<topic>-<seq>.md` に**構造化された問い合わせ**を Write し、user に「host で `/host-answer` を回して」と告知してから ans file の出現を background polling で auto-pickup する skill (box 側 monitor のみ。host 側 auto-pickup は injection chain 防止のため**意図的に持たない** — limitations 参照)。
+Skill that, when a claude session running in box (sbx microVM) needs host-side facts not visible from box (state of other compose projects / port occupier listening on host / host filesystem outside mount / host-local service unreachable due to box network restriction), writes a **structured inquiry** to `.claude/host-bridge/ask-<box-name>-<topic>-<seq>.md`, notifies user "run `/host-answer` on host", and auto-picks up the answer file via background polling (box-side monitor only. host-side auto-pickup **intentionally not implemented** to prevent injection chain — see limitations).
 
-`/box-session-context` (host が box の transcript を覗く) の**逆方向**として対をなす leaf skill (`box → host` の能動 ask)。両者は重複せず補完関係。
+Leaf skill that pairs as **reverse direction** of `/box-session-context` (host peeks at box transcript): active ask from box → host. Both don't overlap but are complementary.
 
-## 前提条件
+## Prerequisites
 
-- **box (sbx microVM) の中で実行** する skill。host 側で起動すると意味がない (ans 待ちのループが host 上で生じるだけ)
-- **bind mount された cwd 配下** に `.claude/host-bridge/` を Write できる権限。`sbx run ... .` は cwd を box の `/workspace` (or 同等) に bind するため host 側からも同じパスで見える
-- 対応する `/host-answer` skill が project に同梱されており、host 側 claude が起動済み or user がすぐ起動できること
-- box 内で `$SANDBOX_VM_ID` env が set されていること (dev.sh / dev.sh sandbox で box を立てれば自動で set される、statusLine にも `[$SANDBOX_VM_ID]` として表示される)
+- **Run inside box (sbx microVM)**. Pointless if launched on host (just creates ans-waiting loop on host)
+- **Permission to Write `.claude/host-bridge/`** under bind-mounted cwd. `sbx run ... .` binds cwd to box's `/workspace` (or equivalent) so host sees same path
+- Corresponding `/host-answer` skill bundled in project, host-side claude running or user can start soon
+- `$SANDBOX_VM_ID` env set inside box (auto-set when launching box with dev.sh / dev.sh sandbox, displayed as `[$SANDBOX_VM_ID]` in statusLine)
 
-## 発火 trigger (box agent が「これは host にしか分からない」と判断する例)
+## Trigger (examples of when box agent recognizes "only the host can answer this")
 
-box agent は以下のような状況で本 skill を発火させる:
+Box agent fires this skill in situations like:
 
-- **host の listen port の占有者を知りたい** (例: `:80` を誰が握っているか、box 内では `lsof` も `docker ps` も host process を見れない)
-- **他 project の compose / container の素性を知りたい** (例: 既存 Traefik / nginx / redis 等が host で動いていて、相乗りすべきか別途立てるべきかの判断材料)
-- **mount 外の host filesystem path の中身** (例: 別 project の `docker-compose.yml` の設定値、host の `~/.config/<tool>/` の存在確認)
-- **host-local service への到達** (box の network 制限で到達できない `host.docker.internal` 経由の service 等)
-- **host shell の env / dotfiles の状態** (受講者環境固有の事情で box 内挙動が説明できないとき)
+- **Wanting to know who occupies a listening port on host** (example: who holds `:80`, as `lsof` and `docker ps` inside box can't see host processes)
+- **Wanting to know the identity of another project's compose / container** (example: existing Traefik / nginx / redis, etc. running on host; information to decide whether to piggyback or stand up separately)
+- **Contents of host filesystem paths outside the mount** (example: config values in another project's `docker-compose.yml`, existence check of host's `~/.config/<tool>/`)
+- **Reaching host-local services** (services via `host.docker.internal` unreachable due to box network restrictions, etc.)
+- **Host shell env / dotfiles state** (when box behavior is unexplained due to participant environment specifics)
 
-「box 内で `cat` / `docker ps` / `lsof` 等で確認可能」なものは host 側に振らない (本 skill は host 越境の専用経路で、box 内で解決できる質問を回さない)。
+Don't route to host things verifiable via `cat` / `docker ps` / `lsof`, etc. inside box (this skill is a dedicated cross-host path; it doesn't answer questions solvable inside the box).
 
-## 使い方
+## Usage
 
-引数 = `<topic> [<question>]`
+Arguments = `<topic> [<question>]`
 
-- `<topic>`: 1 つの問題を表す slug。`[a-z0-9-]{1,32}` (例: `traefik-port` / `port80-owner` / `host-fs-layout` / `jal-compose-config`)。**1 topic = 1 問題のスレッド**で、follow-up clarification は同 topic 内で seq を進める。解決したら新 topic を切る
-- `<question>` (省略可): 1-3 行の自然文で「欲しい事実」を summarize。省略時は ask file の `## 欲しい事実` セクションを空欄で起こし、box agent が会話 context から本文を埋める
+- `<topic>`: A slug representing one issue. `[a-z0-9-]{1,32}` (example: `traefik-port` / `port80-owner` / `host-fs-layout` / `jal-compose-config`). **1 topic = 1 problem thread**; follow-up clarifications progress seq within the same topic. Create a new topic once resolved.
+- `<question>` (optional): 1-3 lines of natural text summarizing "the needed fact". If omitted, create the `## Needed fact` section in the ask file blank, and the box agent fills the body from conversation context.
 
-## 手順
+## Steps
 
-1. **自 box 名取得**: `printenv SANDBOX_VM_ID` で env を読み `<box-name>` とする (例: `coding-agent-playbook-4632ea`)。env が空 (= box 外で誤起動 / `$SANDBOX_VM_ID` 未 set の異常 box) なら自走を止めて user に「`SANDBOX_VM_ID` env が読めません。dev box 内で本 skill を起動してください」と escalate
+1. **Get own box name**: Read env via `printenv SANDBOX_VM_ID` and set as `<box-name>` (example: `coding-agent-playbook-4632ea`). If env is empty (= misfire outside box / `$SANDBOX_VM_ID` unset in anomalous box), stop autonomous execution and escalate to user: "`SANDBOX_VM_ID` env not readable. Launch this skill inside dev box."
 
-2. **bridge dir 確保**: `mkdir -p .claude/host-bridge` を実行する (gitignore 対象で fresh clone には存在しないため、`.claude/host-bridge/` が無い状態でも Write が確実に通るよう毎回実行する。冪等で副作用なし)
+2. **Ensure bridge dir**: Run `mkdir -p .claude/host-bridge` (it's gitignored and absent in fresh clones, so run every time to ensure Write succeeds even if `.claude/host-bridge/` doesn't exist. Idempotent, no side effects)
 
-3. **次の seq 算出**:
-   - `ls .claude/host-bridge/ask-<box-name>-<topic>-[0-9][0-9][0-9].md 2>/dev/null | sort | tail -1` で同 topic の最大 seq を取得 (`[0-9][0-9][0-9]` の anchored 文字 class 形にすることで topic prefix の衝突 = `port` glob が `port-80` を hit する罠を回避。 `<seq>` は 3 桁ゼロ埋めのため plain `sort` の lexicographic 順で数値順と一致。GNU 拡張の `sort -V` は macOS/BSD sort 非対応で cross-platform 違反 ([CLAUDE.md](../../../CLAUDE.md) `## cross-platform 要件`) のため使わない)
-   - 既存無しなら `001`、ありなら `+1` してゼロ埋め 3 桁
+3. **Compute next seq**:
+   - Run `ls .claude/host-bridge/ask-<box-name>-<topic>-[0-9][0-9][0-9].md 2>/dev/null | sort | tail -1` to get the max seq for the same topic (anchored character class `[0-9][0-9][0-9]` avoids topic prefix collision traps like `port` glob hitting `port-80`. `<seq>` is zero-padded 3 digits, so plain `sort` lexicographic order matches numeric order. GNU extension `sort -V` doesn't work on macOS/BSD sort—a cross-platform violation ([CLAUDE.md](../../../CLAUDE.md) "Cross-platform requirements")—so don't use it)
+   - If none exist, use `001`; if exist, add 1 and zero-pad to 3 digits
 
-4. **新 seq の stale ans / sentinel を予防削除 → ask file を Write**: 新規 ask の発火前に、自 seq に対応する `ans-...md` / `ans-...md.done` の遺物を `rm -f` で削除する (lifecycle cleanup を怠った場合や同 box/topic で seq 採番が衝突した場合に stale sentinel が残り、手順 5 の polling が起動直後に `[ -f ANS.done ]` を即座 true と判定して `cat` が旧 body を取り込む race の予防):
+4. **Preventively delete stale ans / sentinel for new seq → Write ask file**: Before firing the new ask, delete remnants of `ans-...md` / `ans-...md.done` for this seq with `rm -f` (prevents race where stale sentinel remains from skipped lifecycle cleanup or seq collision on the same box/topic, causing step 5's polling to immediately judge `[ -f ANS.done ]` true at startup and `cat` to ingest old body):
    ```bash
    rm -f .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md \
          .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md.done
    ```
-   `-f` で fresh ask (遺物無し) の場合は no-op。続けて `.claude/host-bridge/ask-<box-name>-<topic>-<seq>.md` に下記 format で書く
+   `-f` is a no-op for fresh asks (no remnants). Then write `.claude/host-bridge/ask-<box-name>-<topic>-<seq>.md` in the format below
 
-5. **ans wait の Monitor を起動 (persistent)**: **primary path** として Monitor tool を `persistent: true` で起動し **done sentinel** の出現を polling、検出したら本体を cat する (box 側のみの auto-pickup、host 側は user-trigger のまま — security 根拠は下記 limitations 参照):
+5. **Launch Monitor for ans-wait (persistent)**: **Primary path**: Launch Monitor tool with `persistent: true` to poll for **done sentinel**, detect it, then cat the body (box-side auto-pickup only; host-side stays user-triggered — security rationale below under limitations):
    ```text
    Monitor({
      command: "until [ -f .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md.done ]; do sleep 30; done; cat .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md",
@@ -60,66 +60,66 @@ box agent は以下のような状況で本 skill を発火させる:
      description: "ans wait for <box-name>/<topic>/<seq>"
    })
    ```
-   **Monitor `persistent: true` を使う理由 (Bash `run_in_background` ではなく)**: Bash tool の `run_in_background` は `BASH_MAX_TIMEOUT_MS` (default 600000 = 10 分、env で上限変更可能だが hard cap あり) で kill される。host 側 user の `/host-answer` 応答時間は HOTL ワークフローで 10 分を超えうる (user が他作業中・並列 PR 監視中・席を外している等)。Monitor `persistent: true` は session-length watch (no timeout) で、command が exit するまで自然に持続する。**Monitor schema の「single event は Bash run_in_background 推奨」は数分以内に終わる short job 前提**で、本 use case (いつ来るか分からない event を待つ) には合わない。
+   **Why use Monitor `persistent: true` instead of Bash `run_in_background`**: Bash tool's `run_in_background` is killed at `BASH_MAX_TIMEOUT_MS` (default 600000 = 10 minutes; env-changeable with hard cap). Host-side user's `/host-answer` response time can exceed 10 minutes in HOTL workflow (user busy with other tasks / monitoring parallel PRs / away from desk, etc.). Monitor `persistent: true` is a session-length watch (no timeout) that naturally persists until the command exits. **Monitor schema's "single event recommend Bash run_in_background" assumes short jobs finishing within minutes**; this use case (waiting for an event with unknown arrival) doesn't fit.
 
-   **Monitor が利用不能な環境での fallback path**: Monitor は Claude Code 2.1.98+ の機能で、以下の環境では使えない (公式 [Tools reference](https://code.claude.com/docs/en/tools-reference) 参照):
-   - **Claude Code < 2.1.98** (古い CLI version)
-   - **Bedrock / Vertex / Foundry** (代替モデルプロバイダ)
-   - **`DISABLE_TELEMETRY=1` / `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`** (telemetry 経路で起動するため)
+   **Fallback path for environments where Monitor is unavailable**: Monitor is a Claude Code 2.1.98+ feature, unavailable in these environments (see official [Tools reference](https://code.claude.com/docs/en/tools-reference)):
+   - **Claude Code < 2.1.98** (old CLI version)
+   - **Bedrock / Vertex / Foundry** (alternative model providers)
+   - **`DISABLE_TELEMETRY=1` / `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`** (launched via telemetry path)
 
-   これらの環境では fallback として:
-   - **(a) Bash `run_in_background`**: 同じ command を `Bash({command: "until ... done; cat ANS", run_in_background: true})` で起動 (10 分 timeout cap あり、HOTL 応答が 10 分超えると無音で kill されるため次善策)。完了通知の取り込み: `BashOutput(bash_id="<task-id>")` または notification の `<output-file>` を `Read` で読む (Bash の stdout は file 経由なため Monitor と違って明示取得が必要)
-   - **(b) manual cat (旧フロー)**: 手順 6 の告知メッセージに「ans が来たら知らせてください、`cat .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md` で取り込みます」を含める。HOTL handoff 2 段になるが、environment 制約下では最小機能を保証する経路
+   In these environments, fallback as:
+   - **(a) Bash `run_in_background`**: Launch same command as `Bash({command: "until ... done; cat ANS", run_in_background: true})` (has 10-minute timeout cap; HOTL response exceeding 10 minutes silently kills, so second-best). Capture completion notification: `BashOutput(bash_id="<task-id>")` or `Read` the notification's `<output-file>` (Bash stdout is file-based; unlike Monitor, needs explicit retrieval)
+   - **(b) manual cat (legacy flow)**: Include in step 6's notification: "Please notify when ans arrives; we'll ingest via `cat .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md`". Two-stage HOTL handoff, but ensures minimum functionality under environment constraints
 
-   どの path を採るかは、box agent が起動時に Monitor が使えるか probe するか、または環境を事前に把握して選ぶ (確実な runtime detection は現状 doc から指示できないため、Monitor 起動が tool error で失敗したら (a) → (b) の順に fallback)。
+   Which path to take: box agent probes at startup whether Monitor is available, or pre-knows the environment (reliable runtime detection isn't currently doc-instructable; if Monitor launch fails with tool error, fallback (a) → (b) in order).
 
-   **sentinel (`.md.done`) を polling 対象にする理由**: `/host-answer` が ans 本体を Write してから別 step で sentinel を touch する serialization で、sentinel 出現 = 本体完成済みを保証する (race-free)。ans 本体を直接 polling すると Write ツールの非 atomic な書き込み (truncate + sequential write) 途中で `[ -f ans...md ]` が true になり `cat` が half-written 状態を取り込む race window がある。`until [ -f X ]` は POSIX shell で動く (box image の bash / busybox いずれでも portable)。`sleep 30` interval で host 側 user の `/host-answer` 実行を 30 秒粒度で待つ。Monitor は sentinel 出現で 1 度だけ `cat` を実行して exit (stdout 全行が 200ms 内なら 1 notification にまとまる、small ans file は通常 1 event)
+   **Why poll sentinel (`.md.done`) rather than the ans body**: `/host-answer` serializes by writing ans body, then in a separate step touches the sentinel—sentinel appearance guarantees body completion (race-free). Polling the ans body directly races: Write tool's non-atomic writes (truncate + sequential) cause `[ -f ans...md ]` to true mid-write, so `cat` ingests half-written state. `until [ -f X ]` runs in POSIX shell (portable across bash and busybox in box images). `sleep 30` interval waits for host-side user's `/host-answer` at 30-second granularity. Monitor executes `cat` once at sentinel appearance and exits (all stdout lines within 200ms bundle into 1 notification; small ans files typically 1 event)
 
-6. **user に告知して本筋作業に戻る**: 起動した path に応じて以下を分けて告知 (Bash fallback では 10 分 timeout の honesty を保つため Monitor とは別文言にする):
+6. **Notify user and return to main work**: Split notification based on which path launched (Bash fallback uses different wording than Monitor to maintain honesty about 10-minute timeout):
 
-   **(primary / Monitor `persistent: true`) session-length auto-pickup**:
+   **(Primary / Monitor `persistent: true`) Session-length auto-pickup**:
    ```text
-   📤 host info request 書きました: .claude/host-bridge/ask-<box-name>-<topic>-<seq>.md
+   📤 Written host info request: .claude/host-bridge/ask-<box-name>-<topic>-<seq>.md
 
-   host 側 claude で次を実行してください:
+   Run this on the host-side claude:
      /host-answer <box-name> <topic>
 
-   ans が書かれたらこちらで自動 pickup します (Monitor persistent、session-length 待機、30 秒粒度の sentinel polling)。それまで他の作業を続けます。
+   Once ans is written, we'll auto-pickup here (Monitor persistent, session-length wait, 30-second-granularity sentinel polling). Continuing other work in the meantime.
    ```
 
-   **(Bash fallback) 10 分以内 auto-pickup、超えたら manual に倒す**:
+   **(Bash fallback) Auto-pickup within 10 minutes; manual fallback beyond**:
    ```text
-   📤 host info request 書きました: .claude/host-bridge/ask-<box-name>-<topic>-<seq>.md
+   📤 Written host info request: .claude/host-bridge/ask-<box-name>-<topic>-<seq>.md
 
-   host 側 claude で次を実行してください:
+   Run this on the host-side claude:
      /host-answer <box-name> <topic>
 
-   ans が 10 分以内に書かれればこちらで auto-pickup します (Bash run_in_background、30 秒粒度の sentinel polling)。
-   ⚠️ 10 分超過時は Bash の timeout (BASH_MAX_TIMEOUT_MS hard cap) で polling が無音 kill されます。10 分以内に届かない場合は ans 到着を知らせてください (manual cat に倒します)。
+   If ans arrives within 10 minutes, we'll auto-pickup here (Bash run_in_background, 30-second-granularity sentinel polling).
+   ⚠️ Beyond 10 minutes, Bash timeout (BASH_MAX_TIMEOUT_MS hard cap) silently kills polling. If it doesn't arrive within 10 minutes, please notify when ans arrives (we'll manual-cat).
    ```
 
-   **(manual cat fallback) Monitor / Bash background が両方使えない場合**:
+   **(manual cat fallback) When both Monitor and Bash background unavailable**:
    ```text
-   📤 host info request 書きました: .claude/host-bridge/ask-<box-name>-<topic>-<seq>.md
+   📤 Written host info request: .claude/host-bridge/ask-<box-name>-<topic>-<seq>.md
 
-   host 側 claude で次を実行してください:
+   Run this on the host-side claude:
      /host-answer <box-name> <topic>
 
-   ans が来たら知らせてください (こちらで `cat .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md` で取り込みます)。
+   Please notify when ans arrives (we'll manual-cat via `cat .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md`).
    ```
-   この path では HOTL handoff 2 段だが auto-pickup 経路が無い環境での最小機能を保証する
+   This path is 2-stage HOTL handoff but guarantees minimum functionality in environments without auto-pickup paths
 
-   告知後は ans を blocking で待たず、可能な範囲で本筋タスクを進める。Monitor の `cat` が sentinel 検出後に exit すると stdout 全行が notification として届く (Bash fallback の場合は notification + `<output-file>` Read、ただし timeout 後は手順 7 の Bash timeout handling 経路)
+   After notifying, don't block waiting for ans; advance the main task as much as possible. Monitor's `cat` exits after detecting sentinel and all stdout lines arrive as notification (Bash fallback: notification + `<output-file>` Read, but beyond timeout use step 7's Bash timeout handling path)
 
-7. **ans 取り込み (path 別 + Bash timeout handling)**:
-   - **(primary / Monitor)**: Monitor は stdout の各行を event として notification 化する (200ms 内の連続行は 1 notification にまとまるため、small ans file は通常 1 event = ans 全文が 1 つの notification として届く)。明示 Read 不要、context に直接届く
-   - **(Bash fallback / 正常完了 = sentinel 検出 < 10 分)**: task-notification は task 完了の event のみで stdout は `<output-file>` (絶対 path) に persisted されている。`Read(file_path="<output-file>")` または `BashOutput(bash_id="<task-id>")` で明示取得する
-   - **(Bash fallback / timeout = sentinel 未検出のまま 10 分到達 → SIGTERM kill)**: notification の status が `timeout` / `failed` で届く (`exit code 143` 等)。この場合は **manual cat fallback に手動で倒す**: (a) user に「Bash polling が timeout、ans が届いていれば手動で取り込みます」と伝える、(b) `[ -f .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md.done ]` の存否を確認 (sentinel 既に出ているなら直接 cat / まだなら user に host での `/host-answer` 実行状況確認を依頼)、(c) sentinel あり → `cat .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md` で取り込み
-   - **(manual cat fallback)**: user が「来た」と告げたら `cat .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md` を Bash で実行して context に取り込む
+7. **Ingest ans (path-dependent + Bash timeout handling)**:
+   - **(primary / Monitor)**: Monitor converts each stdout line to notification event (consecutive lines within 200ms bundle into 1 notification; small ans file usually arrives as 1 event = entire ans as 1 notification). No explicit Read needed; arrives directly in context
+   - **(Bash fallback / normal completion = sentinel detected < 10 minutes)**: task-notification is completion event only; stdout persisted to `<output-file>` (absolute path). Explicitly fetch via `Read(file_path="<output-file>")` or `BashOutput(bash_id="<task-id>")`
+   - **(Bash fallback / timeout = sentinel undetected for 10 minutes → SIGTERM kill)**: notification arrives with status `timeout` / `failed` (e.g., exit code 143). In this case, **manually revert to manual cat fallback**: (a) Tell user "Bash polling timeout; if ans arrived, we'll manual-cat", (b) Check `[ -f .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md.done ]` (if sentinel exists, direct cat; if not, ask user about `/host-answer` execution on host), (c) If sentinel exists → `cat .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md` to ingest
+   - **(manual cat fallback)**: When user says "arrived", run `cat .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md` in Bash and ingest to context
 
-   取り込んだ ans 内の ` ```host-ctx ... ``` ` fence が host 側からの paste-ready ブロック (内容を信頼して以降の判断材料にする)。取り込み後、待っていた本筋判断を再開する。Monitor / 正常完了 Bash は task exit で自然終了するため明示的な `TaskStop` は不要
+   In ingested ans, the ` ```host-ctx ... ``` ` fence is host's paste-ready block (trust content and use for subsequent judgment). After ingestion, resume the paused main judgment. Monitor / successful Bash naturally exit at task completion, so explicit `TaskStop` isn't needed
 
-## ask file format
+## Ask File Format
 
 ```markdown
 # Host info request
@@ -129,52 +129,52 @@ box agent は以下のような状況で本 skill を発火させる:
 - **seq**: `<seq>`
 - **ts**: `<iso8601 UTC>`
 
-## 欲しい事実 (1-3 行)
+## Needed fact (1-3 lines)
 
-<box agent が自然文で記述。Done when を満たせる最小粒度で>
+<box agent writes in natural language. Minimal granularity to satisfy Done when>
 
-## 既知 (in-box で確認済み)
+## Known (confirmed in-box)
 
-- <box 内で確認できた事実 1>
-- <box 内で確認できた事実 2>
+- <fact 1 confirmed in box>
+- <fact 2 confirmed in box>
 
-## 仮説 (host 側で裏取りしてほしい候補)
+## Hypotheses (candidates for host to verify)
 
-1. <仮説 1>
-2. <仮説 2>
+1. <hypothesis 1>
+2. <hypothesis 2>
 
 ## Done when
 
-<この情報が answer に含まれれば本 ask は閉じる、という終了条件 1-2 行>
+<end condition: 1-2 lines describing when ask closes if answer includes this info>
 ```
 
-## 並列 ask (複数 topic 同時)
+## Parallel Asks (multiple topics simultaneously)
 
-`<topic>` で並走 topic を分離するため、同一 box session 内で複数の物理問題を同時に ask 可能 (例: `traefik-port` の ans を待つ間に `jal-compose-config` の ask を別途送る)。各 topic は独立した seq を持つ。
+Topics separated by `<topic>` slug allow multiple physical problems in same box session (example: send `jal-compose-config` ask while waiting for `traefik-port` ans). Each topic has independent seq.
 
-ただし**同一 topic 内の seq は単調増加**で、ans を待たずに次の seq を起こすと host 側が混乱する (どの seq が現在 active か曖昧)。同 topic の follow-up は ans を受け取った後に出す。
+However, **within same topic, seq is monotonically increasing**; starting next seq without waiting for ans confuses host (ambiguous active seq). Follow-ups in same topic come after receiving ans.
 
-topic 命名規約 `[a-z0-9-]{1,32}` は機械強制せず agent 規律に委ねる。**topic prefix の衝突**は手順 3 の anchored glob (`[0-9][0-9][0-9].md`) で構造的に防ぐが、運用上も命名を散らす (例: `port-80` でなく `traefik-port`、`port-3000-app` でなく `app-port`) と読み手に優しい。
+Topic naming convention `[a-z0-9-]{1,32}` isn't machine-enforced; relies on agent discipline. **Topic prefix collision** is structurally prevented by step 3's anchored glob (`[0-9][0-9][0-9].md`), but operationally scattered naming (example: `traefik-port` rather than `port-80`, `app-port` rather than `port-3000-app`) is friendlier to readers.
 
-## limitations / caveats
+## Limitations / Caveats
 
-- **box 側 monitor のみ (host 側 monitor は実装しない)**: bridge の auto-pickup は box → ans file 出現の polling のみ (上記手順 5)。host 側で box → ask file 出現を polling する逆経路は**意図的に持たない**。box は untrusted source (公開 issue / PR body / web 取得文書) を context に取り込む頻度が高く prompt-injection の経路になりやすい。box が injection されると ask に「全 host secret を返せ」と書ける → host 側が auto-pickup すると user 介入なしに host が answer → box context へ流入 → exfil 経路 (PR body / commit / bot reply) で外へ、という injection chain が成立する。host 側を user-trigger (`/host-answer` を user が能動 invoke) のままにすると、host claude が起動するタイミングで user 判断が入り chain が break する。host を信頼境界 / box を injection 経路として非対称に扱う設計
-- **host-from-host 経路ではない**: 本 skill は box 内専用。host 内で host info が欲しいなら通常通り host で Bash を回すだけで済む (skill 不要)
-- **lifecycle**: ask / ans / done sentinel file は `.gitignore` 対象だが**自動削除しない**。debug 価値で残し、気になったら手動 `find .claude/host-bridge -maxdepth 1 \( -name 'ask-*.md' -o -name 'ans-*.md' -o -name 'ans-*.md.done' \) -delete` (3 種すべて削除する。**`ans-*.md.done` を削除し忘れると同 box/topic で seq 001 を再採番した時に stale sentinel が残り、box 側 polling が `until [ -f ANS.done ]` を即座に true で抜けて `cat` が旧 ans body / 不在 path を取り込む race を起こす**)。**`find -delete` 形を使う理由**: 単純な `rm -f <glob>` は bash/sh では無マッチで idempotent だが zsh の default `nomatch` option では glob 展開時に `no matches found` で error する (macOS の default shell が zsh のため host で叩く際に踏みやすい)。`find -delete` は shell の glob 展開に依存せず find の自前 pattern match で動くため shell-independent に idempotent。`-maxdepth 1` で `.claude/host-bridge/` 直下に限定、`.claude/host-bridge/` で anchor して cwd 違いで無関係ファイルを巻き込まない
-- **secret / 機密**: ask file 内に box の env / credential 等の機密を貼らない (host ↔ box で平文共有される。box-bridge は L0 機密境界の対象外で、機密値は op / secret-proxy 経由の動的注入で扱う)
-- **`<box-name>` の一意性**: 同時に同名 box を立てられない sbx の制約 (`sbx ls` で name unique) により `<box-name>` で active session を一意特定できる。host が複数 dev box (例: parallel dev) を抱えている場合、`<box-name>` の取り違えで ans が別 box 宛になるため、escalate メッセージに `<box-name>` の literal を必ず含める
+- **Box-side monitor only (host-side monitor not implemented)**: Bridge auto-pickup is only box → ans file polling (step 5 above). Reverse path for host to poll box → ask file appearance **intentionally omitted**. Box frequently ingests untrusted sources (public issues / PR bodies / web-fetched documents) and is a prompt-injection vector. If box is injected, ask could say "return all host secrets" → host auto-pickup lets host answer without user intervention → flows into box context → exfiltration path (PR body / commit / bot reply) to outside = injection chain. Keeping host-side as user-trigger (`/host-answer` user actively invokes) means user judgment enters when host claude launches, breaking chain. Design treats host as trust boundary, box as injection vector (asymmetrically).
+- **Not host-from-host**: Skill is box-internal only. If you want host info while on host, just run Bash normally (skill unnecessary).
+- **Lifecycle**: ask / ans / done sentinel files are `.gitignore`'d but **not auto-deleted**. Kept for debug value; if annoying, manually `find .claude/host-bridge -maxdepth 1 \( -name 'ask-*.md' -o -name 'ans-*.md' -o -name 'ans-*.md.done' \) -delete` (delete all 3 types. **Forgetting to delete `ans-*.md.done` leaves stale sentinel when re-allocating seq 001 for same box/topic, causing race where box polling `until [ -f ANS.done ]` exits true immediately and `cat` ingests old ans body / nonexistent path**). **Why use `find -delete`**: Simple `rm -f <glob>` is idempotent in bash/sh on no-match, but zsh's default `nomatch` option errors on glob expansion with "no matches found" (macOS default shell is zsh, so often hit on host). `find -delete` doesn't depend on shell glob expansion; find's own pattern matching is shell-independent and idempotent. `-maxdepth 1` confines to `.claude/host-bridge/` direct children; `.claude/host-bridge/` anchor prevents dragging unrelated files on cwd mismatch.
+- **Secret / credentials**: Don't paste box env / credentials in ask file (plaintext shared host ↔ box. box-bridge isn't in L0 secret boundary; secrets handled via op / secret-proxy dynamic injection).
+- **Uniqueness of `<box-name>`**: sbx constraint of not standing same-named boxes simultaneously (`sbx ls` shows name unique), so `<box-name>` uniquely identifies active session. When host has multiple dev boxes (e.g., parallel dev), wrong `<box-name>` sends ans to different box, so always include literal `<box-name>` in escalate message.
 
-## トラブルシューティング
+## Troubleshooting
 
-| 問題 | 対処 |
+| Issue | Resolution |
 |------|------|
-| `printenv SANDBOX_VM_ID` が空 | box 外で誤起動 / 異常 box の可能性。dev.sh / dev.sh sandbox で box を立て直すか、`<box-name>` を user paste で fallback |
-| `.claude/host-bridge/` が存在しない | 手順 2 で `mkdir -p` するため通常は発生しない。permission denied なら bind mount の write 権を確認 |
-| host 側 claude が `/host-answer` を持っていない | 本 PR が host にも反映されているか確認 (project skill は両側 clone 同梱の前提) |
-| ans が来ない (Monitor notification が届かない) | (1) user が host で `/host-answer <box-name> <topic>` を実行したか確認 (host 側は user-trigger、自動では走らない)。(2) Monitor の生存を `TaskList` で確認。`until` ループが回り続けているなら ans file が未生成 = host 側未実行。(3) 待ち時間が長い場合は user に明示的に escalate して Monitor を kill (`TaskStop <task-id>`) |
-| ans 本体は書かれたが sentinel (`.md.done`) が無い | `/host-answer` が旧版 (sentinel touch 未対応) で動いた可能性。host で `touch .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md.done` を手動実行するか、新版 `/host-answer` で再投入してもらう |
-| ans 出現したのに `cat` が走らない | `[ -f X ]` は regular file のみ true。sentinel が symlink で来ている等の特殊ケースは `[ -e X ]` 形にして手動で再起動 (通常の `/host-answer` 経路では regular file が touch される) |
-| Monitor notification を受けたが ans が context に入っていない | Monitor は stdout を直接 stream する設計のため通常は発生しない。万一 missed なら `TaskList` / `TaskOutput` で Monitor の output を確認 |
-| Monitor が永久に exit しない (host が応答放棄) | `TaskStop <task-id>` で Monitor を kill。topic を放棄するなら ask file も `rm` してから次の作業へ |
-| 同 topic で seq がぶつかった (並走で誤って ask を二重に起こした) | 古い方の ask を `rm` + 対応する Monitor を `TaskStop` してから seq を採り直す |
-| `<box-name>` を間違えて ans が別 box 宛になった | ans file 名の `<box-name>` を訂正して新規 ans として box 側で `cat` する (Monitor は元の `<box-name>` で polling 中なので `TaskStop` して新 path で再起動) |
+| `printenv SANDBOX_VM_ID` is empty | Misfire outside box / anomalous box. Recreate box with dev.sh / dev.sh sandbox or fallback to user paste for `<box-name>` |
+| `.claude/host-bridge/` doesn't exist | Step 2 runs `mkdir -p` so usually doesn't happen. If permission denied, verify bind mount write permissions |
+| Host-side claude lacks `/host-answer` | Check if this PR is reflected on host too (project skills assumed bundled in both clones) |
+| ans doesn't arrive (Monitor notification doesn't appear) | (1) Verify user ran `/host-answer <box-name> <topic>` on host (host-side is user-trigger, not automatic). (2) Check Monitor liveness via `TaskList`. If `until` loop continues, ans file not generated = host side not run. (3) For long wait, explicitly escalate to user and kill Monitor (`TaskStop <task-id>`) |
+| ans body written but sentinel (`.md.done`) missing | Possible old `/host-answer` version (sentinel touch unsupported) ran. Manually run `touch .claude/host-bridge/ans-<box-name>-<topic>-<seq>.md.done` on host or resubmit with new `/host-answer` |
+| ans appeared but `cat` doesn't run | `[ -f X ]` is true only for regular files. If sentinel is symlink or similar, use `[ -e X ]` form and manually restart (normal `/host-answer` path touches regular file) |
+| Monitor notification received but ans not in context | Monitor design streams stdout directly, so usually doesn't happen. If missed, check Monitor output via `TaskList` / `TaskOutput` |
+| Monitor never exits (host gives up responding) | Kill Monitor with `TaskStop <task-id>`. If abandoning topic, `rm` ask file too before next task |
+| seq collision in same topic (accidentally started double ask in parallel) | `rm` old ask + `TaskStop` corresponding Monitor, then re-allocate seq |
+| Wrong `<box-name>` causes ans to go to different box | Correct `<box-name>` in ans file name and `cat` as new ans on box side (Monitor polling with original `<box-name>`, so `TaskStop` and restart with new path) |

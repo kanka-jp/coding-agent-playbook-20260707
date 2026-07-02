@@ -1,59 +1,59 @@
-# Box Ops（sbx box のライフサイクル）
+# Box Ops (sbx box lifecycle)
 
-box-primary 運用の実行基盤 = **sbx（Docker Sandboxes）の box の中で claude / codex を動かす**（YOLO/隔離、microVM-per-agent）。本 rule は box の環境準備・起動・並列・host escape hatch・後片付けの手順をまとめる。開発フロー全体は [CLAUDE.md](../CLAUDE.md)「開発フロー」、image/mixin の中身は [sbx/README.md](../sbx/README.md) 参照。
+The operational foundation of box-primary mode = **running claude / codex inside sbx (Docker Sandboxes) boxes** (YOLO/isolated, microVM-per-agent). This rule covers the procedures for box environment setup, launch, parallel execution, host escape hatch, and cleanup. See [CLAUDE.md](../CLAUDE.md) "Development Flow" for the full development flow, and [sbx/README.md](../sbx/README.md) for image/mixin details.
 
-## 0. 環境準備（マシンに一度。全 project で再利用）
+## 0. Environment Setup (Once per machine. Reusable across all projects)
 
-image はマシン単位で load すれば project 非依存で使い回せる:
+Images can be loaded at the machine level and reused independently of the project:
 
 ```bash
-sbx login                                              # 後続の sbx secret set / image pull 等で必須 (template load 自体はローカル tar なので不要)
-docker build --load -t coding-agent-playbook-sbx sbx/ # claude/codex/uv/python を同梱した汎用箱 (--load: BUILDX_BUILDER non-default driver でも local image store に入れる)
+sbx login                                              # Required for subsequent sbx secret set / image pull etc. (template load itself uses local tar, so not needed)
+docker build --load -t coding-agent-playbook-sbx sbx/ # Generic box with claude/codex/uv/python included (--load: puts into local image store even with non-default BUILDX_BUILDER driver)
 docker save coding-agent-playbook-sbx -o cap-sbx.tar
-sbx template load cap-sbx.tar                          # sbx は local image を共有せず pull するため load 必須
+sbx template load cap-sbx.tar                          # sbx does not share local images, so load is required
 ```
 
-**secret 登録**（box の外で proxy 注入が原則。一部経路で token が box 内に provision される例外あり、security トレードオフは [sbx/README.md](../sbx/README.md)）:
+**Secret registration** (proxy injection outside box is the principle. Exception: in some paths, tokens are provisioned inside box; security tradeoff is explained in [sbx/README.md](../sbx/README.md)):
 
-- **claude**: サブスク並列は `claude setup-token` → `sbx secret set -g anthropic`（全 box 自動認証・推奨）。単発は箱内 `/login`。API key は `sbx secret set -g anthropic`
-- **codex**: built-in claude agent の同居 box (codex 同梱) は OAuth proxy 注入が効かない (agent-gating) ため、host で `codex login` 済みの `~/.codex/auth.json` を box 内に転送（転送先 dir 事前作成 + `sbx cp` + 所有者変更の 3 ステップ、詳細は [sbx/README.md](../sbx/README.md) の「codex のサブスク認証」）。**built-in codex agent の専用 box (codex reviewer pair = `cdx-<NAME>`)** は `sbx secret set -g openai --oauth` で作成時に proxy 注入（token は box に入らない、auth.json 転送不要）
+- **claude**: For subscription parallelism, use `claude setup-token` → `sbx secret set -g anthropic` (automatic authentication for all boxes, recommended). For single-session, use `/login` inside box. For API key, use `sbx secret set -g anthropic`
+- **codex**: Built-in claude agent's cohabiting box (codex included) cannot use OAuth proxy injection (agent-gating), so transfer `~/.codex/auth.json` from host after `codex login` to the box (3 steps: pre-create transfer dest dir + `sbx cp` + change ownership; see [sbx/README.md](../sbx/README.md) "codex subscription authentication"). **Built-in codex agent's dedicated box (codex reviewer pair = `cdx-<NAME>`)** uses `sbx secret set -g openai --oauth` for proxy injection at creation time (token doesn't enter box, auth.json transfer not needed)
 
-## 1. box 起動
+## 1. Box Launch
 
 ```bash
-# 単発 dev box (host worktree を bind-mount。auto-name + cdx-<NAME> reviewer pair auto-provision)
+# Single dev box (bind-mount host worktree. auto-named with auto-provisioned cdx-<NAME> reviewer pair)
 bash scripts/dev.sh
 
-# 明示名 dev box (idempotent attach-or-create)
+# Named dev box (idempotent attach-or-create)
 bash scripts/dev.sh <NAME>
 
-# 並列 dev box (引数なしを別ターミナルで複数回、各 dev box が独立 cdx pair を持つ)
+# Parallel dev boxes (run multiple with no args in separate terminals; each dev box gets independent cdx pair)
 bash scripts/dev.sh
 bash scripts/dev.sh
-bash scripts/dev.sh ls [-q]                             # 一覧 + cdx 状態 (-q で name only)
-bash scripts/dev.sh attach [<NAME|N>]                   # 再 attach (引数なしは picker)
-bash scripts/dev.sh kill <NAME|N>                       # 停止 (cdx-<NAME> pair も同時破棄)
-bash scripts/dev.sh prune [--yes] [--all]               # orphan cdx pair / stale lease / stale lock を一括 cleanup (引数なしは dry-run、--all で CDX=none な dev box 本体も対象。--all は sbx ls --json で status=running を skip (jq 必須、不在 / parse fail で fail-closed abort)、dev.sh shell attached や直接 sbx exec 中の box は誤削除されない。delete 直前に running を再 snapshot して scan→delete window の race も防ぐ)
+bash scripts/dev.sh ls [-q]                             # List + cdx status (-q for name only)
+bash scripts/dev.sh attach [<NAME|N>]                   # Re-attach (no args = picker)
+bash scripts/dev.sh kill <NAME|N>                       # Terminate (also destroys paired cdx-<NAME>)
+bash scripts/dev.sh prune [--yes] [--all]               # Bulk cleanup of orphan cdx pairs / stale leases / stale locks (no args = dry-run; --all includes dev boxes without CDX. --all uses sbx ls --json to skip status=running (jq required; failure/parse error = fail-closed abort). Dev.sh shell attached or direct sbx exec boxes are not mistakenly deleted. Re-snapshots running just before delete to prevent race between scan and delete window)
 
-# sandbox box (--clone .、cdx pair なし、PR 化前の ad-hoc 探索用)
+# Sandbox box (--clone ., no cdx pair, for ad-hoc exploration before PR)
 bash scripts/dev.sh sandbox [<NAME>]
 ```
 
-- 起動で `.mcp.json` / CLAUDE.md がロードされる（box は claude+codex 同居）
-- **dev box (bind-mount)** なら host の `.worktrees/<NN>/` が box から見える（worktree は `--relative-paths` で作るので box 内でも `git -C .worktrees/<NN>` が効く）
-- **sandbox box (`--clone .`)** は host の `.worktrees/`（git 管理外）を持ち込まないため、その中で stage を扱うなら box 内で `bash scripts/internal/setup-worktrees.sh` を実行する
+- Startup loads `.mcp.json` / CLAUDE.md (box co-hosts claude+codex)
+- **dev box (bind-mount)** makes host's `.worktrees/<NN>/` visible from box (worktree is created with `--relative-paths` so `git -C .worktrees/<NN>` works inside box too)
+- **sandbox box (`--clone .`)** doesn't bring host's `.worktrees/` (untracked) so if handling stage inside it, run `bash scripts/internal/setup-worktrees.sh` in box
 
-## 2. host escape hatch（host に出るのは限られた用途）
+## 2. Host Escape Hatch (limited uses for leaving the box)
 
-基本は box の中。host 権限が要る時だけ host に出る:
+Default is inside the box. Only leave for host-privileged tasks:
 
-1. 操作を見ながらのブラウザ確認（host で headful chrome-devtools）
-2. docker 操作（並列起動の Traefik 等）
-3. その他 host 権限が要るもの
+1. Browser verification with visual feedback (headful chrome-devtools on host)
+2. Docker operations (Traefik for parallel startup etc.)
+3. Other host-privileged tasks
 
-box 内 dev server は `sbx ports <box> --publish <port>` で host に publish する（publish 直後に `127.0.0.1:<host port>->...` が出力される。後から再確認するには `sbx ports <box>`）。
+Dev server inside box is published to host via `sbx ports <box> --publish <port>` (outputs `127.0.0.1:<host port>->...` immediately after publish. Re-check anytime with `sbx ports <box>`).
 
-## 3. 後片付け
+## 3. Cleanup
 
-- dev box を消す: `bash scripts/dev.sh kill <NAME|N>` (cdx-`<NAME>` reviewer pair も同時破棄)。sandbox box は `sbx rm <box>`
-- codex reviewer pair box (`cdx-<NAME>`) は dev box の TTY 終了時に dev.sh の trap で auto-teardown される (per-pair lifecycle、[setup.md](../docs/setup.md))。trap が走らずに残った orphan / stale lease / stale lock は **`bash scripts/dev.sh prune`** (dry-run で削除候補確認 → `--yes` で実行) で一括 cleanup する。stale sbx policy 系は `sbx policy ls` で確認して `sbx policy rm <id>`
+- Kill dev box: `bash scripts/dev.sh kill <NAME|N>` (also destroys paired cdx-`<NAME>` reviewer). Sandbox box: `sbx rm <box>`
+- Codex reviewer pair box (`cdx-<NAME>`) auto-tears down via dev.sh trap on TTY exit (per-pair lifecycle, [setup.md](../docs/setup.md)). Orphan/stale leases/locks left if trap doesn't run are bulk-cleaned with **`bash scripts/dev.sh prune`** (dry-run shows deletion candidates → `--yes` to execute). Stale sbx policy entries: check with `sbx policy ls` and remove with `sbx policy rm <id>`

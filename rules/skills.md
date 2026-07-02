@@ -1,59 +1,59 @@
-# Skills（粒度とレイヤー）
+# Skills (granularity and layers)
 
-skill / capability を **抽象度のレイヤー**で扱う。上にいくほど抽象（何を・いつ）、下にいくほど具体（どう・実体）で、各層は「1 つ下」だけを知り、下の詳細を隠して具体化を委譲する（SOLID の「抽象に依存する」と同型）。本 rule は本 repo の skill 構造の SoT。フロー全体は [CLAUDE.md](../CLAUDE.md)「開発フロー」、skill 同梱の前提は [CLAUDE.md](../CLAUDE.md)「Workshop 前提」参照。
+Skills / capabilities are organized **by abstraction layer**. Higher layers are more abstract (what / when), lower layers are more concrete (how / implementation), and each layer knows only "one level below," hiding lower details and delegating to concrete implementations (homomorphic to SOLID's "depend on abstractions"). This rule is the SoT for skill structure in this repo. For overall flow, see [CLAUDE.md](../CLAUDE.md) "Development Flow"; for the assumption of bundled skills, see [CLAUDE.md](../CLAUDE.md) "Workshop Assumption".
 
-## レイヤー
+## Layers
 
-| レイヤー | 抽象度 | 役割 | 例 |
+| Layer | Abstraction | Role | Example |
 |---|---|---|---|
-| **フロー層**（CLAUDE.md + rules/） | 最も抽象 | lifecycle と「いつ・どの skill が発火するか」。skill ではない常時 context | 「開発フロー」overview |
-| **orchestrator skill** | 中 | フェーズを束ね、leaf skill を compose + 操作系チェックを回す | `pr-codex-ci` |
-| **leaf skill** | 具体 | 単機能。上位を呼ばない。素のツールに**抽象を 1 枚足す**（文脈判定・正規化等） | `a2a-review` |
-| **scripts / tools** | 最も具体 | skill が駆動する実体 | `scripts/internal/a2a-review.sh` / `server.py` |
+| **Flow layer** (CLAUDE.md + rules/) | Most abstract | Lifecycle and "when/which skill fires." Not a skill itself; always-present context | "Development Flow" overview |
+| **orchestrator skill** | Mid | Composes phases, composes leaf skills + runs operational checks | `pr-codex-ci` |
+| **leaf skill** | Concrete | Single-purpose. Does not call up. Adds **one layer of abstraction** to raw tools (context judgment, normalization, etc.) | `a2a-review` |
+| **scripts / tools** | Most concrete | Implementation that skills drive | `scripts/internal/a2a-review.sh` / `server.py` |
 
-例: フロー「PR を作ったら review+CI を回す」→ orchestrator は実行環境で 2 系統 (`pr-codex-ci` = box / `pr-ci` = host)「review=`/a2a-review` or `/codex-review`・CI check（stale/run-id 判定込み）・loop」→ leaf `a2a-review`「box から A2A 経由で cdx-pair に投げる」/ `codex-review`「host CLI を直接 exec」→ tool `internal/a2a-review.sh`「A2A で codex 起動」/ `codex` CLI 自体。各段で 1 つ抽象が剥がれて具体になる。
+Example: Flow "after PR creation, run review + CI" → orchestrator has 2 variants by execution environment (`pr-codex-ci` = box / `pr-ci` = host) with "review = `/a2a-review` or `/codex-review`·CI check (including stale/run-id judgment)·loop" → leaf `a2a-review` "send from box via A2A to cdx-pair" / `codex-review` "directly exec host CLI" → tool `internal/a2a-review.sh` "launch codex via A2A" / `codex` CLI itself. At each step, one layer of abstraction is peeled off and made concrete.
 
-## 合成のルール
+## Composition rules
 
-- **呼び出しは上→下のみ**（フロー層 → orchestrator → leaf → tools）。**循環禁止**（下は上を知らない）
-- **skill→skill は orchestrator → leaf に限る**（leaf は他 skill を呼ばない or 最小限）。Claude Code は Skill ツールで skill→skill を実際にサポートする（`pr-codex-ci` が `/a2a-review` を呼ぶのが実例）。**呼び出し側 skill の `allowed-tools` で gate されない**ため、orchestrator の `allowed-tools` に被呼び出し leaf を列挙する必要はない
-- **環境ディスパッチ例外（peer 呼び出し可）**: box / host で同一役割の skill が別実装になる場合（`codex-review` ↔ `a2a-review`、`pr-ci` ↔ `pr-codex-ci`）、実行環境を検出して対応 skill に委譲することを許可する。条件: **単方向**（被委譲 skill が呼び出し元を呼び戻さない）かつ**ループにならない**こと。この委譲は leaf→leaf / orchestrator→orchestrator になるが、フロー層で判断すべきことを skill 内 safety check として実装した形と解釈する。検出はフロー層（CLAUDE.md / invoke 直前の `printenv SANDBOX_VM_ID` 確認）が理想で skill 内は二重安全網
-- **各 skill のレイヤーは本 rule の「現状マッピング」表を SoT とする**（skill ファイル側に重複宣言せず drift を防ぐ）。skill の description は `orchestrator` / `leaf` の語を**自分のレイヤーと矛盾する形で使わない**（例: leaf skill の説明に "orchestration" を使わない）
-- **層は抽象として意味を持つこと**。素のツールへ素通りするだけ（pass-through）の leaf を作らない＝ tool-wrapper を無闇に増やさない。何も足さないなら skill にせず orchestrator から直接ツールを叩く
-- **レイヤー数は必要最小**（現状フロー / orchestrator / leaf / tools の 4 つで十分。増やさない）
+- **Calls are top→bottom only** (flow layer → orchestrator → leaf → tools). **No cycles** (lower layers don't know about higher layers).
+- **Skill→skill only orchestrator → leaf** (leaves don't call other skills, or minimally). Claude Code actually supports skill→skill via the Skill tool (`pr-codex-ci` calling `/a2a-review` is the example). **Calls are not gated by the calling skill's `allowed-tools`**, so orchestrator `allowed-tools` doesn't need to list called leaves.
+- **Environment dispatch exception (peer calls allowed)**: When the same role has different skill implementations on box vs. host (`codex-review` ↔ `a2a-review`, `pr-ci` ↔ `pr-codex-ci`), you may detect the execution environment and delegate to the appropriate skill. Conditions: **unidirectional** (delegate skill doesn't call back the caller) and **no loops**. This delegation becomes leaf→leaf / orchestrator→orchestrator, but we interpret it as implementing a flow-layer judgment as a skill-internal safety check. Ideally, detection happens at flow layer (CLAUDE.md / check `printenv SANDBOX_VM_ID` before invoke); skill-internal is a secondary safety net.
+- **Each skill's layer uses the "Current Mapping" table in this rule as SoT** (avoid duplicate declarations in skill files to prevent drift). Skill descriptions must not use the words `orchestrator` / `leaf` in a way that **contradicts the skill's own layer** (example: don't use "orchestration" in a leaf skill's description).
+- **Layers must mean something as abstractions**. Don't create leaf skills that just pass-through raw tools (no tool-wrappers without purpose). If you're adding nothing, don't make it a skill—call the tool directly from the orchestrator.
+- **Minimal layer count** (current flow / orchestrator / leaf / tools = 4 is sufficient; don't add more).
 
-## 現状マッピング
+## Current Mapping
 
-| skill | レイヤー | 内容 |
+| Skill | Layer | Description |
 |---|---|---|
-| `a2a-review` | **leaf** | **box-native** codex review を 1 回依頼。box 内から cdx-`<NAME>` pair の codex に A2A 経由で投げ、文脈判定 (sandbox box 除外) と reviewer 到達性を足す。superpowers の `requesting-code-review` 相当 |
-| `codex-review` | **leaf** | **host-native** codex review。host インストールの `codex` CLI を直接 exec して PR diff / ファイル / 自由指示の second opinion を取る。`/a2a-review` の host 対称 (transport が違うだけ、契約は同) |
-| `comment-sweep` | **leaf** | pre-PR sweep。新規追加コメントを [rules/code-comments.md](code-comments.md) 規範で判定 → 違反テーブル提示 → ユーザー承認後 Edit で修正。default は `origin/HEAD...HEAD` diff、`--staged` / `--worktree` / `BASE_BRANCH` 引数あり |
-| `co-evolve-check` | **leaf** | pre-PR sweep。retention bias（旧版残置 = `interface UserOld` + `User` 並走 / `getUserNew` wrapper 等）を検出。caller が全 touched + public marker なしで `Confidence: high`。non-blocking report-only |
-| `extension-bloat-sweep` | **leaf** | pre-PR sweep。既存 file / 関数 / シグネチャへの無理な拡張（E1: 既存大型 file 末尾追加 / E2: param ≥ 4 or optional ≥ 3 / E6: 同一 file の複数回 modify）を検出。non-blocking report-only |
-| `pr-codex-ci` | **orchestrator** | **box-native** post-PR フェーズ。**ローカル** codex review (`a2a-review` を compose) + **CI check** + **`pr-review-respond` を compose した remote gate** + 修正ループ |
-| `pr-ci` | **orchestrator** | **host-native** post-PR フェーズ。`codex-review` (host codex CLI 直) を compose + **CI check** + **`pr-review-respond` を compose した remote gate** + 修正ループ。`pr-codex-ci` の host 対称 |
-| `pr-review-respond` | **leaf** | **GitHub に post された** PR review（Copilot/qodo 等 bot + 人間）を fetch → 採否 → 修正/reply → resolve。`gh api` を直接駆動し sub-skill を呼ばない。caller orchestrator (`pr-codex-ci` / `pr-ci`) には structured result (`pushed_changes` / `resolved_count` / `final_unresolved` / `checks_terminal`) を返して終了する（**上位 orchestrator を呼び戻さず cycle を回避**）。orchestrator (codex 第二意見の呼び出し) とは独立した別行為で単独 invoke も可 |
-| `host-ask` | **leaf** | box 内から host 側の事実 (他 compose project / 既存 container / port 占有者 / mount 外 host fs / host-local service) を必要としたとき、`.claude/host-bridge/ask-<box-name>-<topic>-<seq>.md` に構造化 ask を Write し user に escalate。`<box-name>` は `$SANDBOX_VM_ID` env から取得 (hook 非依存)。`/box-session-context` (host から box transcript) の逆方向 (box → host の能動 ask) で、両者は補完関係。`<topic>` で並列 ask 対応 (1 box 内で複数物理問題を同時に走らせられる) |
-| `host-answer` | **leaf** | host 側で `/host-ask` が書いた ask file を読み、host 側調査 (docker / lsof / 他 compose 設定 read-only) を回して `.claude/host-bridge/ans-<box-name>-<topic>-<seq>.md` に paste-ready answer (` ```host-ctx ``` ` fence) を Write し user に escalate。`host-ask` の counterpart |
-| `box-session-context` | **leaf** | host から box 内 Claude session の transcript を取り出し**参照専用**で要約。`scripts/internal/box-session-context.sh` を駆動。box-primary の HOTL 監視 (statusLine の session id → host で確認) を埋める。`/box-session-resume` (継続) と pair |
-| `box-session-resume` | **leaf** | box 内 session を host / 別 box に inject し `claude --resume` で**同一 session 実再開**。source 自動特定 → dest の project dir に元 UUID 名で置く。**環境ディスパッチ**: host 起動は `scripts/internal/box-session-resume.sh` を直接実行、box 起動は host-bridge に resume-req を書いて `/box-session-resume-grant` に委譲 (box→host の peer 委譲、`codex-review`↔`a2a-review` と同型)。旧 `box-session-handoff` を置換。`/box-session-context` (参照) と pair |
-| `box-session-resume-grant` | **leaf** | host 側で box の resume-req (`/box-session-resume` box-delegate が書いた `.claude/host-bridge/resume-req-<box>-<seq>.md`) を読み、内容を表示 (injection gate) して `scripts/internal/box-session-resume.sh` を実行、`resume-ans-<box>-<seq>.md` + done sentinel を Write。`/host-answer` の resume 版だが**状態変更を実行**する点が異なる。`/box-session-resume` の box-delegate モードの host 側 counterpart |
+| `a2a-review` | **leaf** | **box-native** codex review, single invocation. From within a box, sends to the cdx-`<NAME>` pair codex via A2A, adding context judgment (sandbox box exclusion) and reviewer reachability. Equivalent to superpowers' `requesting-code-review` |
+| `codex-review` | **leaf** | **host-native** codex review. Directly execs the host-installed `codex` CLI to obtain second opinion on PR diffs / files / free-form instructions. Host symmetric to `/a2a-review` (only transport differs; contract is the same) |
+| `comment-sweep` | **leaf** | Pre-PR sweep. Judges newly added comments against [rules/code-comments.md](code-comments.md) norms → presents violation table → fixes via Edit after user approval. Default is `origin/HEAD...HEAD` diff; supports `--staged` / `--worktree` / `BASE_BRANCH` args |
+| `co-evolve-check` | **leaf** | Pre-PR sweep. Detects retention bias (lingering old versions = `interface UserOld` + `User` running parallel / `getUserNew` wrapper, etc.). Caller without touching all + no public marker = `Confidence: high`. Non-blocking, report-only |
+| `extension-bloat-sweep` | **leaf** | Pre-PR sweep. Detects forced expansions of existing files / functions / signatures (E1: appending to existing large file / E2: param ≥ 4 or optional ≥ 3 / E6: multiple modifies to same file). Non-blocking, report-only |
+| `pr-codex-ci` | **orchestrator** | **box-native** post-PR phase. **Local** codex review (composes `/a2a-review`) + **CI check** + **remote gate composing `/pr-review-respond`** + fix loop |
+| `pr-ci` | **orchestrator** | **host-native** post-PR phase. Composes `codex-review` (host codex CLI direct) + **CI check** + **remote gate composing `/pr-review-respond`** + fix loop. Host symmetric to `pr-codex-ci` |
+| `pr-review-respond` | **leaf** | Fetches **PR reviews posted to GitHub** (bot + human from Copilot/qodo, etc.) → decides accept/reject → fixes/replies → resolves. Directly drives `gh api`, doesn't call sub-skills. Returns structured result (`pushed_changes` / `resolved_count` / `final_unresolved` / `checks_terminal`) to caller orchestrator (`pr-codex-ci` / `pr-ci`) and exits (**avoids cycles by not calling back the orchestrator**). Independent from orchestrator (codex second opinion invocation); also available for standalone invocation |
+| `host-ask` | **leaf** | When inside a box needing host-side facts (other compose project / existing container / port holder / host fs outside mount / host-local service), Writes structured ask to `.claude/host-bridge/ask-<box-name>-<topic>-<seq>.md` and escalates to user. `<box-name>` obtained from `$SANDBOX_VM_ID` env (hook-independent). Reverse direction of `/box-session-context` (host → box transcript) for active ask (box → host); they complement each other. `<topic>` enables parallel asks (multiple physical issues in 1 box simultaneously) |
+| `host-answer` | **leaf** | On host, reads ask file written by `/host-ask`, runs host-side investigation (docker / lsof / other compose config read-only), Writes paste-ready answer to `.claude/host-bridge/ans-<box-name>-<topic>-<seq>.md` (` ```host-ctx ``` ` fence) and escalates to user. Counterpart to `host-ask` |
+| `box-session-context` | **leaf** | Pulls Claude session transcript from inside box on host, summarizes **read-only**. Drives `scripts/internal/box-session-context.sh`. Fills box-primary HOTL monitoring gap (statusLine session id → verify on host). Pairs with `/box-session-resume` (continuation) |
+| `box-session-resume` | **leaf** | Injects box-internal session into host / another box and **resumes as the same session** via `claude --resume`. Auto-detects source → places in dest's project dir under original UUID name. **Environment dispatch**: host invocation directly runs `scripts/internal/box-session-resume.sh`, box invocation writes resume-req to host-bridge and delegates to `/box-session-resume-grant` (box→host peer delegation, homomorphic to `codex-review`↔`a2a-review`). Replaces old `box-session-handoff`. Pairs with `/box-session-context` (reference) |
+| `box-session-resume-grant` | **leaf** | On host, reads box resume-req (`.claude/host-bridge/resume-req-<box>-<seq>.md` written by `/box-session-resume` box-delegate), displays contents (injection gate), execs `scripts/internal/box-session-resume.sh`, Writes `resume-ans-<box>-<seq>.md` + done sentinel. Resume version of `/host-answer`, but **executes a state change** (differs from read-only). Host-side counterpart of `/box-session-resume` box-delegate mode |
 
-## 操作系チェック（CI check 等）の位置づけ
+## Positioning of operational checks (CI check, etc.)
 
-CI check / dynamic verify 等の**操作系チェックも leaf レベルの capability** で、post-PR orchestrator が compose する具体化要素。フロー上は「PR 後 = review + CI check + ...」として組み込まれる（[CLAUDE.md](../CLAUDE.md)「開発フロー」step 4 / [rules/pr-followup.md](pr-followup.md)）。
+**Operational checks like CI check / dynamic verify are also leaf-level capabilities**, concrete elements the post-PR orchestrator composes. In flow, they're embedded as "post-PR = review + CI check + ..." ([CLAUDE.md](../CLAUDE.md) "Development Flow" step 4 / [rules/pr-followup.md](pr-followup.md)).
 
-- **CI check** は `pr-codex-ci` と `pr-ci` の両 orchestrator の手順 3（CI gate）に inline で実装されている。素の `gh pr checks` ではなく、push 直後の stale 判定・run-id 解決・対話 TUI hang 回避・一過性 0-checks と CI 未設定の区別といった抽象を持つ（[.claude/skills/pr-codex-ci/SKILL.md](../.claude/skills/pr-codex-ci/SKILL.md) / [.claude/skills/pr-ci/SKILL.md](../.claude/skills/pr-ci/SKILL.md)）。
-- **現状は inline duplicate**。consumer が `pr-codex-ci` + `pr-ci` の 2 つになった時点で本来は leaf skill（`/ci-gate` 等）へ昇格する規範だが、`pr-ci` 追加時の暫定として両 orchestrator に inline duplicate のまま残してある。**leaf extract は follow-up PR で行う**（[https://github.com/kanka-jp/coding-agent-playbook/issues](https://github.com/kanka-jp/coding-agent-playbook/issues) に CI-gate extract issue を起こす）。判断軸は「抽象の有無」ではなく**独立再利用の有無**で、2 consumer 状態を理由に extract する判断は維持する（dotfiles で verify / deploy-watch が skill 化されているのと同型）。
+- **CI check** is implemented inline in step 3 (CI gate) of both `pr-codex-ci` and `pr-ci` orchestrators. Not raw `gh pr checks`, but with abstraction: stale detection right after push, run-id resolution, TUI hang avoidance, distinction between transient 0-checks and unconfigured CI ([.claude/skills/pr-codex-ci/SKILL.md](../.claude/skills/pr-codex-ci/SKILL.md) / [.claude/skills/pr-ci/SKILL.md](../.claude/skills/pr-ci/SKILL.md)).
+- **Currently inline duplicate**. Once consumers reach 2 (`pr-codex-ci` + `pr-ci`), the norm would be to promote to a leaf skill (`/ci-gate`, etc.), but we left it as inline duplicate across both orchestrators temporarily when `pr-ci` was added. **Leaf extraction happens in a follow-up PR** (file a CI-gate extract issue at [https://github.com/kanka-jp/coding-agent-playbook/issues](https://github.com/kanka-jp/coding-agent-playbook/issues)). The decision axis is not "presence of abstraction" but **presence of independent reuse**, and we maintain the decision to extract based on reaching 2 consumers (homomorphic to how verify / deploy-watch are skill-ified in dotfiles).
 
-## 今後の追加指針
+## Future addition guidelines
 
-- 新 skill は**フェーズ（プラクティス）単位**で、tool-wrapper を leaf として増やさない（superpowers は tool-wrapper を持たず、すべてフェーズ skill）
-- orchestrator は leaf を compose、leaf は単機能に保つ。**フロー層（CLAUDE.md）に step として接続**する（orchestrator = フローの step）
-- skill を足す前に「どのレイヤーか・1 段下に何を委譲するか・どんな抽象を足すか」を本 rule のマッピングに追記する
-- **frontmatter は最小限（`name` / `description`）に絞る**。`allowed-tools` は Claude Code 標準フィールドだが、box が YOLO（`--dangerously-skip-permissions`）で permission をバイパスするため load-bearing でなく、書かない。`maturity` や description の `[EXPERIMENTAL]` prefix は**標準 Claude Code に無い** dotfiles 固有の記載なので使わない（project は dotfiles 非依存）
+- New skills should be added **at the phase (practice) level**, not tool-wrappers as leaves (superpowers has no tool-wrappers; all are phase skills).
+- Orchestrator composes leaves, leaves stay single-purpose. **Connect as steps to the flow layer (CLAUDE.md)** (orchestrator = flow step).
+- Before adding a skill, note in this rule's mapping "which layer / what to delegate one level down / what abstraction to add."
+- **Minimize frontmatter (`name` / `description` only)**. `allowed-tools` is a standard Claude Code field, but since the box is YOLO (`--dangerously-skip-permissions`) and bypasses permissions, it's not load-bearing; don't write it. `maturity` and `[EXPERIMENTAL]` prefix in description are **dotfiles-specific, not standard Claude Code**, so don't use them (project is dotfiles-independent).
 
-## 背景
+## Background
 
-obra/superpowers（[https://github.com/obra/superpowers](https://github.com/obra/superpowers)）は flat な fine-grained skill（フェーズ単位）を Basic Workflow で合成し自動トリガーする構成で、tool-wrapper を持たない。本 repo はこれと dotfiles の「CLAUDE.md = 規範 / rules = 詳細 / skills = 実行」を踏まえ、**抽象度のレイヤーで粒度を扱い、CLAUDE.md 開発フローを合成層（最も抽象）に据える**。skill を大きくまとめるのではなく、fine-grained skill をレイヤーで整理し、orchestrator が leaf を compose する。
+obra/superpowers ([https://github.com/obra/superpowers](https://github.com/obra/superpowers)) uses a flat fine-grained skill (phase-level) structure that composes and auto-triggers via Basic Workflow, with no tool-wrappers. This repo builds on that and the dotfiles principle "CLAUDE.md = norms / rules = details / skills = execution," and **handles granularity via abstraction layers, positioning CLAUDE.md's development flow as the composition layer (most abstract)**. Rather than bundling skills large, we organize fine-grained skills by layer and have the orchestrator compose leaves.

@@ -1,298 +1,298 @@
 ---
 name: comment-sweep
 argument-hint: "[--staged | --worktree | BASE_BRANCH]"
-description: "Reviews newly added code comments in a git diff against rules/code-comments.md. Detects identifier paraphrase, WHAT/HOW explanation of next code, comparison comments ('既存の X と異なり'), change history references (Copilot 指摘 / issue ID prefix / 'added for' / 'fixes URL'), 3+ line blocks compressible to a 1-line WHY, and duplicate sentences within a block. Default scans the diff between the PR base and HEAD for PR readiness. '--staged' scans the index, '--worktree' scans tracked uncommitted changes, BASE_BRANCH (any positional arg) overrides the base ref. Auto-skips when base..HEAD contains only revert commits (subjects all start with 'Revert \"'). Use BEFORE 'gh pr create', or when the user mentions コメントチェック / コメント sweep / comment review / 余計なコメント / コメント不適切."
+description: "Reviews newly added code comments in a git diff against rules/code-comments.md. Detects identifier paraphrase, WHAT/HOW explanation of next code, comparison comments ('differs from existing X'), change history references (Copilot findings / issue ID prefix / 'added for' / 'fixes URL'), 3+ line blocks compressible to a 1-line WHY, and duplicate sentences within a block. Default scans the diff between the PR base and HEAD for PR readiness. '--staged' scans the index, '--worktree' scans tracked uncommitted changes, BASE_BRANCH (any positional arg) overrides the base ref. Auto-skips when base..HEAD contains only revert commits (subjects all start with 'Revert \"'). Use BEFORE 'gh pr create', or when the user mentions comment check / comment sweep / comment review / unnecessary comments / comment inappropriate."
 ---
 
 # comment-sweep
 
-PR / staged / worktree diff の **新規追加コメント行**を [rules/code-comments.md](../../../rules/code-comments.md) の規範に照らして判定し、違反箇所を報告して修正まで導く leaf skill ([rules/skills.md](../../../rules/skills.md))。`/pr-codex-ci` の前段として走らせると、codex review が低レベル指摘 (コメント余計) に時間を使わなくなる。
+Leaf skill ([rules/skills.md](../../../rules/skills.md)) that judges **newly added comment lines** in PR / staged / worktree diff against the norms of [rules/code-comments.md](../../../rules/code-comments.md), reports violations, and guides to fixes. When run as a pre-step to `/pr-codex-ci`, codex review doesn't spend time on low-level findings (unnecessary comments).
 
-## いつ使うか
+## When to use
 
-- **PR 作成前 (推奨)**: `gh pr create` の**前**。実装直後・テスト直後等、push 前に sweep を通す
-- **既存 PR への追加 push 前**: review 対応や bug fix の差分にも適用 (commit 後・push 前に default モードで)
-- **ユーザーから「コメント不適切」「余計なコメント」等の指摘を受けた直後**: 全変更ファイルに対し再 sweep
-- **PR を作らない一時的な変更でも**: commit 前に `--staged` または `--worktree` モードで動かしてよい
+- **Before PR creation (recommended)**: **Before** `gh pr create`. Right after implementation/testing etc., run sweep before push
+- **Before adding to an existing PR**: Also applies to review response and bug fix diffs (after commit, before push in default mode)
+- **Right after user points out "comment inappropriate", "unnecessary comment" etc**: Re-sweep against all changed files
+- **Even for temporary changes not creating PR**: Can run in `--staged` or `--worktree` mode before commit
 
-## 引数モード
+## Argument modes
 
-| 引数 | 対象 diff | 用途 |
+| Argument | Target diff | Purpose |
 |------|----------|------|
-| (なし) | `git diff origin/<HEAD-branch>...HEAD` (HEAD-branch は `origin/HEAD` の symbolic-ref から決定。後述) | PR 作成前の最終 sweep |
-| `BASE_BRANCH` (`--` で始まらない任意 1 引数) | `git diff origin/<BASE_BRANCH>...HEAD` | base を明示する場合 (リモート tracking ref を使う) |
-| `--staged` | `git diff --cached` (index) | commit 前 sweep |
-| `--worktree` | `git diff HEAD` (tracked かつ uncommitted。**untracked は含まない**) | 未 commit の tracked 変更を全部含めたい時 |
+| (none) | `git diff origin/<HEAD-branch>...HEAD` (HEAD-branch determined from `origin/HEAD` symbolic-ref, see below) | Final sweep before PR creation |
+| `BASE_BRANCH` (any 1 arg not starting with `--`) | `git diff origin/<BASE_BRANCH>...HEAD` | When explicitly specifying base (use remote tracking ref) |
+| `--staged` | `git diff --cached` (index) | Sweep before commit |
+| `--worktree` | `git diff HEAD` (tracked and uncommitted. **untracked not included**) | When wanting all uncommitted tracked changes |
 
-複数指定不可。フラグでなく数字でもない任意の 1 引数は `BASE_BRANCH` として扱う。`--worktree` で untracked な新規ファイルも対象にしたい場合は事前に `git add -N <path>` で intent-to-add してから呼ぶ。
+Cannot specify multiple. Any single arg that's not a flag or number is treated as `BASE_BRANCH`. If you want untracked new files included with `--worktree`, first run `git add -N <path>` for intent-to-add before calling.
 
-## 手順
+## Procedure
 
 ```text
 Sweep Progress:
-- [ ] Step 1: モード判定と diff 取得
-- [ ] Step 1.5: Lightweight-PR diff の検出 (default / BASE_BRANCH モードのみ)
-- [ ] Step 2: 追加コメント行の抽出とブロック化
-- [ ] Step 3: 各ブロックを規範で判定
-- [ ] Step 4: 違反テーブルをユーザーに提示
-- [ ] Step 5: ユーザー承認後 Edit で修正
-- [ ] Step 6: 再 sweep で残違反ゼロを確認
+- [ ] Step 1: Mode judgment and diff acquisition
+- [ ] Step 1.5: Lightweight-PR diff detection (default / BASE_BRANCH mode only)
+- [ ] Step 2: Extract and block newly added comment lines
+- [ ] Step 3: Judge each block against norms
+- [ ] Step 4: Present violation table to user
+- [ ] Step 5: Fix via Edit after user approval
+- [ ] Step 6: Re-sweep to confirm zero remaining violations
 ```
 
-### Step 1: モード判定と diff 取得
+### Step 1: Mode judgment and diff acquisition
 
-引数を解釈してモードを決定。default モード (引数なし) の base は **`origin/HEAD` (デフォルトブランチ)** を使う。feature branch の upstream を base にすると `git diff origin/feat/x...HEAD` が空になり sweep が false-negative で通ってしまうため、必ず `origin/HEAD` 由来で決定する。
+Interpret argument to determine mode. For default mode (no args), use **`origin/HEAD` (default branch)** as base. Using feature branch upstream as base would make `git diff origin/feat/x...HEAD` empty and sweep would false-negatively pass; always determine from `origin/HEAD` derived.
 
 ```bash
 git symbolic-ref refs/remotes/origin/HEAD --short
 ```
 
-これが `origin/main` 等を返したら、その branch を base として `...` (triple-dot) diff を取る:
+If this returns `origin/main` etc, use that branch as base and get `...` (triple-dot) diff:
 
 ```bash
 git diff origin/main...HEAD
 ```
 
-`origin/HEAD` が未設定で symbolic-ref が失敗する場合は `BASE_BRANCH` 引数を要求してユーザーに案内する (`git remote set-head origin -a` で再設定可能)。`--staged` / `--worktree` / `BASE_BRANCH` の場合はこの計算をスキップして対応コマンドを直接実行する。`BASE_BRANCH` 引数モードでは `git diff origin/<BASE_BRANCH>...HEAD` を実行する (ローカル branch 名でなくリモート tracking ref を使う)。
+If `origin/HEAD` is not set and symbolic-ref fails, request `BASE_BRANCH` argument and guide user (`git remote set-head origin -a` can reconfigure). For `--staged` / `--worktree` / `BASE_BRANCH` cases, skip this calculation and directly run corresponding command. For `BASE_BRANCH` argument mode, run `git diff origin/<BASE_BRANCH>...HEAD` (use remote tracking ref, not local branch name).
 
-### Step 1.5: Lightweight-PR diff の検出 (auto-skip)
+### Step 1.5: Lightweight-PR diff detection (auto-skip)
 
-`default` / `BASE_BRANCH` モードのみ実行 (`--staged` / `--worktree` は HEAD に commit が無いケースがあるため対象外、通常通り Step 2 へ進む)。
+Run only in `default` / `BASE_BRANCH` modes (`--staged` / `--worktree` excluded since they can be cases with no commit to HEAD; proceed normally to Step 2).
 
-新規追加コメントが構造的に存在しない diff は auto-skip する。判定は共有 helper に委譲する:
+Auto-skip diffs where no new comments structurally exist. Delegate judgment to shared helper:
 
 ```bash
 python3 -I .claude/skills/_shared/pr-skip-policy.py --base <base-ref> --head HEAD --json
 ```
 
-`<base-ref>` は **Step 1 で `git diff <base-ref>...HEAD` に使った base ref そのもの** (default は `origin/main` 等、`BASE_BRANCH` モードは `origin/<BASE_BRANCH>`)。**`origin/` は二重に付けない**。head は本 skill が未 push のローカル commit を含むため `HEAD`。
+`<base-ref>` is **the base ref used in Step 1 with `git diff <base-ref>...HEAD`** (default is `origin/main` etc, `BASE_BRANCH` mode is `origin/<BASE_BRANCH>`). **Don't double `origin/`**. head is `HEAD` since this skill includes unpushed local commits.
 
-出力 JSON の `profile` で分岐する:
+Branch on `profile` in output JSON:
 
-- `pure-revert` → 以下を出力して終了 (revert diff の `+` 行は復元コメントのみで再 sweep 対象外):
+- `pure-revert` → Output and exit (revert diff `+` lines are only restoring comments, not re-sweep targets):
 
   ```text
   ✅ Revert-only diff (skipped)
   ```
 
-- `tiny-json-hotfix` → 以下を出力して終了 (`.claude/` 配下の単一 JSON scalar 値置換等で新規追加コメント行ゼロ):
+- `tiny-json-hotfix` → Output and exit (single JSON scalar value replacement under `.claude/` etc with zero newly added comment lines):
 
   ```text
   ✅ Lightweight PR (tiny-json-hotfix, skipped)
   ```
 
-- `none` → Step 2 へ進む
+- `none` → Proceed to Step 2
 
-helper が exit code 0 以外 (git 失敗等の判定不能) を返した場合も通常フローに倒し Step 2 へ進む。
+If helper returns exit code non-0 (cannot judge due to git failure etc), fall back to normal flow and proceed to Step 2.
 
-### Step 2: 追加コメント行の抽出とブロック化
+### Step 2: Extract and block newly added comment lines
 
-**生成ファイルの除外（抽出前、bun があれば）**: 自動生成ファイルはコメントも生成物でレビュー対象にならないため、ファイルごと sweep から除外する。bun が PATH 上にあれば、呼び出しモードに対応する検出 CLI を実行し、出力 JSON の `generated[].path` を以降の抽出対象から外す:
+**Exclude generated files (before extraction, if bun available)**: Auto-generated files have comments that are also generated artifacts, not review targets, so exclude them file-by-file from sweep. If bun is in PATH, execute the detection CLI corresponding to the invocation mode and exclude `generated[].path` from output JSON in subsequent extraction targets:
 
-| モード | コマンド |
+| Mode | Command |
 |--------|---------|
 | default / `BASE_BRANCH` | `bun --config=/dev/null .claude/skills/_shared/detect-generated-local.ts --range <base-ref>...HEAD` |
 | `--staged` | `bun --config=/dev/null .claude/skills/_shared/detect-generated-local.ts --staged` |
 | `--worktree` | `bun --config=/dev/null .claude/skills/_shared/detect-generated-local.ts --worktree` |
 
-bun が無ければこのステップを skip し、すべての変更ファイルを抽出対象に含める (生成ファイルがあっても false-positive で違反検出するだけで、ユーザー承認段階で除外できる)。除外したファイルは Step 4 で件数と一覧を注記する（黙って消さない）。
+If bun is not available, skip this step and include all changed files in extraction targets (even with generated files, false-positive violations are detected; user approval stage can exclude them). Note excluded files in Step 4 with count and list (don't silently remove).
 
-diff 出力から `^\+(?!\+\+)` で始まる行のうち、**変更ファイルの拡張子に応じた**コメント prefix にマッチするものを抽出する。拡張子ごとに有効な prefix は以下:
+From diff output, extract lines starting with `^\+(?!\+\+)` that match comment prefix **according to the changed file's extension**. Valid prefixes per extension are below:
 
-| 拡張子 | 有効なコメント prefix |
+| Extension | Valid comment prefix |
 |--------|---------------------|
-| `.go` / `.rs` / `.ts` / `.tsx` / `.js` / `.jsx` / `.mjs` / `.cjs` / `.c` / `.h` / `.cpp` / `.hpp` / `.java` / `.swift` / `.kt` / `.scala` / `.dart` | `^\+\s*//` / `^\+\s*/\*` 〜 `\*/` / `^\+\s*\*` (block 継続) |
+| `.go` / `.rs` / `.ts` / `.tsx` / `.js` / `.jsx` / `.mjs` / `.cjs` / `.c` / `.h` / `.cpp` / `.hpp` / `.java` / `.swift` / `.kt` / `.scala` / `.dart` | `^\+\s*//` / `^\+\s*/\*` ~ `\*/` / `^\+\s*\*` (block continuation) |
 | `.py` / `.rb` / `.sh` / `.bash` / `.zsh` / `.yml` / `.yaml` / `.toml` / `.nix` / `Makefile` / `.mk` / `Dockerfile` | `^\+\s*#` (line) |
-| `.md` / `.markdown` / `.html` / `.htm` / `.xml` / `.svg` / `.vue` | `^\+\s*<!--` 〜 `-->` (block) のみ |
-| `.sql` | `^\+\s*--` (line) / `^\+\s*/\*` 〜 `\*/` (block) |
+| `.md` / `.markdown` / `.html` / `.htm` / `.xml` / `.svg` / `.vue` | `^\+\s*<!--` ~ `-->` (block) only |
+| `.sql` | `^\+\s*--` (line) / `^\+\s*/\*` ~ `\*/` (block) |
 | `.ex` / `.exs` | `^\+\s*#` (line) |
 | `.erl` | `^\+\s*%` (line) |
 
-**Markdown ファイル (`.md` / `.markdown`) では `^\+\s*#` を「コメント」として扱わない** — `#` は heading 構文のため `# Usage` / `## Test plan` 等を violation に誤検出するリスクがある。Markdown は `<!-- -->` のみ対象。
+**In Markdown files (`.md` / `.markdown`), don't treat `^\+\s*#` as "comment"** — `#` is heading syntax, risking false-positive violation detection of `# Usage` / `## Test plan` etc. Markdown only targets `<!-- -->`.
 
-判定対象から除外:
+Exclude from judgment:
 
-- shebang (`#!`)
-- linter / formatter / type-check directive (`// eslint-disable-line`, `# noqa: ...`, `// biome-ignore *`, `// @ts-ignore`, `// @ts-expect-error`, `# type: ignore`, `// nolint`, `# pylint:`)
-- license header / copyright block
-- generated file marker (`@generated`)
-- `rules/code-comments.md` 自身を編集中の場合、その規範記述内の例コメント (`// 悪い例` 等) は対象外
+- Shebang (`#!`)
+- Linter / formatter / type-check directive (`// eslint-disable-line`, `# noqa: ...`, `// biome-ignore *`, `// @ts-ignore`, `// @ts-expect-error`, `# type: ignore`, `// nolint`, `# pylint:`)
+- License header / copyright block
+- Generated file marker (`@generated`)
+- When editing `rules/code-comments.md` itself, example comments in that norm description (`// bad example` etc) are excluded
 
-**ブロック化ルール**: 同一ファイル内で連続する追加コメント行 (空行を挟まない) を 1 ブロックとする。間に `+` 以外 (context 行や `-` 行) が挟まれたら別ブロック。
+**Blocking rule**: Consecutive added comment lines in same file (without blank lines in between) form 1 block. If non-`+` (context line or `-` line) is interspersed, separate block.
 
-### Step 3: 各ブロックを規範で判定
+### Step 3: Judge each block against norms
 
-[rules/code-comments.md](../../../rules/code-comments.md) の以下カテゴリで判定。**コメント prefix (`//` / `#` / `--` / `<!--` 等) を strip した本文に対してパターンマッチする** (language-agnostic)。該当する**最も重い違反 1 件**を採用:
+Judge by the following categories in [rules/code-comments.md](../../../rules/code-comments.md). **Pattern match against the body with comment prefix (`//` / `#` / `--` / `<!--` etc) stripped** (language-agnostic). Adopt **the single heaviest violation that applies**:
 
-| カテゴリ | 検出基準 (prefix 除去後の本文に対して) |
+| Category | Detection criterion (against body with prefix removed) |
 |----------|---------|
-| `IDENTIFIER_PARAPHRASE` | 本文の主要名詞が直後 (または直前 doc 位置) の識別子と意味重複 (例: `UserSignupToken は signup 確認用トークンの永続化モデル`) |
-| `NEXT_CODE_WHAT` | 本文が直後 1〜3 行のコードを WHAT/HOW で説明 (例: `重複チェック用の既存ユーザーを登録` の直後に `existingUser := testutil.AddTestUser(...)`) |
-| `COMPARISON` | 「既存の X と異なり」「他の Y と違って」等の対比表現 |
-| `CHANGE_HISTORY` | 以下「CHANGE_HISTORY のキーワード一覧」のいずれかを含む |
-| `BLOCK_TOO_LONG` | 同一ブロックが**3 行以上**で、`code-comments.md` の 2 段判定 (命名で吸収できないか → WHY 1 行に圧縮できないか) を通すと**圧縮可能** (削っても情報損失なし)。3 行以上を即違反扱いにしない |
-| `DUPLICATE_SENTENCE` | 同一ブロック内で同じ要旨の文が複数回現れる (cosine 類似でなく要旨ベースで判定) |
-| `NO_VIOLATION` | `code-comments.md` の「書く価値がある WHY の例」(仕様外制約・トレードオフ理由・既知バグ回避・他箇所と挙動が異なる正当な理由) に該当 |
+| `IDENTIFIER_PARAPHRASE` | Body's main noun semantically duplicates the immediately following (or immediately preceding in doc position) identifier (example: `UserSignupToken is a persistence model of signup confirmation token`) |
+| `NEXT_CODE_WHAT` | Body explains the immediately following 1-3 lines of code in WHAT/HOW (example: `Register existing user for duplicate check` immediately followed by `existingUser := testutil.AddTestUser(...)`) |
+| `COMPARISON` | Comparative expressions like "differs from existing X", "different from other Y" etc |
+| `CHANGE_HISTORY` | Contains any of the keywords in "CHANGE_HISTORY keywords" list below |
+| `BLOCK_TOO_LONG` | Same block **3+ lines**, passing the 2-step judgment in `code-comments.md` (can naming absorb it? → can WHY compress to 1 line?) passes **compressible** (no information loss from deletion). Don't immediately violate 3+ lines |
+| `DUPLICATE_SENTENCE` | Same-essence sentence appears multiple times within same block (essence-based judgment, not cosine similarity) |
+| `NO_VIOLATION` | Matches "examples of WHY worth writing" in `code-comments.md` (spec-external constraint / tradeoff reason / known bug avoidance / justified behavior difference from elsewhere) |
 
-**CHANGE_HISTORY のキーワード一覧** (markdown table 内で regex の `|` が table separator と衝突するため別記):
+**CHANGE_HISTORY keywords list** (separate from markdown table because regex `|` collides with table separator):
 
-- `Copilot 指摘`
-- `[A-Z]{2,}-\d+:` (大文字 issue prefix + 連番、例: `DEV-1234:`)
+- `Copilot finding`
+- `[A-Z]{2,}-\d+:` (uppercase issue prefix + serial, example: `DEV-1234:`)
 - `added for`
-- `\bremoved\b` (単語境界)
-- `\bdeprecated\b` (単語境界)
-- `fixes?\s+#?\d+` (例: `fixes 123`, `fix #456`)
-- `fixes?\s+https?://\S+` (例: `fixes https://example.com/issues/789`)
-- `修正履歴`
+- `\bremoved\b` (word boundary)
+- `\bdeprecated\b` (word boundary)
+- `fixes?\s+#?\d+` (example: `fixes 123`, `fix #456`)
+- `fixes?\s+https?://\S+` (example: `fixes https://example.com/issues/789`)
+- `Fix history`
 - `https?://\S+/(pull|issues)/\d+` (PR / issue URL)
 
-判定にあたって周辺コードが必要なケース (`IDENTIFIER_PARAPHRASE`, `NEXT_CODE_WHAT`) は Read ツールでファイルの該当行を確認する。
+When surrounding code is needed for judgment (`IDENTIFIER_PARAPHRASE`, `NEXT_CODE_WHAT`), use Read tool to check file's relevant lines.
 
-### Step 4: 違反テーブルをユーザーに提示
+### Step 4: Present violation table to user
 
-結果は markdown 表形式で。違反ゼロなら「✅ Comment sweep clean」のみ報告して終了。Step 2 で生成ファイルを除外した場合は、表（または clean 報告）の後に「除外した生成ファイル: N 件（`path1`, `path2`, ...）」を 1 行で注記する。
+Result in markdown table format. If zero violations, report only "✅ Comment sweep clean" and exit. If generated files were excluded in Step 2, after the table (or clean report), note in 1 line: "Excluded generated files: N files (`path1`, `path2`, ...)".
 
 ```markdown
-## Comment sweep 結果
+## Comment sweep results
 
-| # | file:line | カテゴリ | 抜粋 | 提案 |
+| # | file:line | Category | Excerpt | Suggestion |
 |---|-----------|---------|------|------|
-| 1 | `app/foo.ts:42` | NEXT_CODE_WHAT | `// 重複チェック用の既存ユーザーを登録` | 削除 (直後コードが自明) |
-| 2 | `pkg/bar.go:88-92` | BLOCK_TOO_LONG | `// 仕様上はここに到達しない: ...` (5 行) | WHY 1 行に圧縮 or 削除 |
-| 3 | `app/baz.ts:15` | CHANGE_HISTORY | `// Copilot 指摘: ...` | 削除 (git log が SoT) |
+| 1 | `app/foo.ts:42` | NEXT_CODE_WHAT | `// Register existing user for duplicate check` | Delete (following code is obvious) |
+| 2 | `pkg/bar.go:88-92` | BLOCK_TOO_LONG | `// Per spec unreachable here: ...` (5 lines) | Compress WHY to 1 line or delete |
+| 3 | `app/baz.ts:15` | CHANGE_HISTORY | `// Copilot finding: ...` | Delete (git log is SoT) |
 
-合計 N 件 / WHY のみ残せる候補 M 件
+Total N / M candidates can remain as WHY only
 
-修正に進みますか? (y で全件修正 / 番号指定で部分修正 / n で停止)
+Fix now? (y for all / specify numbers for partial / n to stop)
 ```
 
-### Step 5: ユーザー承認後 Edit で修正
+### Step 5: Fix via Edit after user approval
 
-承認方針:
+Approval policy:
 
-- `y` / 「お願いします」 / 「全部」 → 全件 Edit で修正
-- 番号指定 (例: `1,3` / `1-2`) → 該当件のみ
-- `n` / 「やめる」 → 修正せず終了 (違反は報告済み)
+- `y` / "please" / "all" → Fix all via Edit
+- Number specify (example: `1,3` / `1-2`) → Fix only those
+- `n` / "stop" → Stop without fixing (violations already reported)
 
-修正方針 (カテゴリ別):
+Fix policy (per category):
 
-- `IDENTIFIER_PARAPHRASE` / `NEXT_CODE_WHAT` / `COMPARISON` / `CHANGE_HISTORY`: コメント行を**削除**
-- `BLOCK_TOO_LONG`: WHY のみ 1 行に圧縮。圧縮できないなら削除を提案 (`code-comments.md` の 2 段判定: 命名で吸収できないか → WHY 1 行に圧縮できないか)
-- `DUPLICATE_SENTENCE`: 重複部分を削除して 1 文に集約
+- `IDENTIFIER_PARAPHRASE` / `NEXT_CODE_WHAT` / `COMPARISON` / `CHANGE_HISTORY`: **Delete** comment line
+- `BLOCK_TOO_LONG`: Compress WHY to 1 line only. If can't compress, suggest delete (`code-comments.md` 2-step judgment: can naming absorb? → can WHY compress to 1 line?)
+- `DUPLICATE_SENTENCE`: Delete duplicate part and consolidate to 1 sentence
 
-Edit ツールで old_string に違反コメントブロックを含むコンテキスト、new_string に修正後を渡す。1 ファイル複数違反は連続して Edit する。
+Pass to Edit tool: old_string with context including violating comment block, new_string with fixed version. Multiple violations per file: Edit consecutively.
 
-**`--staged` モードでの注意**: Edit は working tree のみを書き換える。次の commit に修正を反映するため、Edit 完了後にユーザーが `git add <修正ファイル>` で**必ず restage** する (restage しないと Step 6 の `git diff --cached` 再 sweep が修正前のままで違反を再検出する)。skill は自動で `git add` を実行しない — ユーザーが対象パスを指定して staging することで意図しない他ファイルの混入を防ぐ。
+**Note for `--staged` mode**: Edit only rewrites working tree. To reflect fix in next commit, user must **always restage** with `git add <fixed-file>` after Edit completes (without restaging, Step 6's `git diff --cached` re-sweep stays with pre-fix state and re-detects violations). Skill doesn't auto-run `git add` — user specifying target paths when staging prevents unintended file inclusion.
 
-### Step 6: 再 sweep で残違反ゼロを確認
+### Step 6: Re-sweep to confirm zero remaining violations
 
-修正後、**モードに応じた diff** で再 sweep を 1 回回す:
+After fixes, re-sweep once using **mode-appropriate diff**:
 
-| モード | 再 sweep の比較対象 | 前提 |
+| Mode | Re-sweep comparison target | Prerequisite |
 |--------|---------------------|------|
-| default / `BASE_BRANCH` | `git diff origin/<base>...HEAD` | 修正を **commit してから** 再 sweep (HEAD が動かないと working tree 修正が反映されない) |
-| `--staged` | `git diff --cached` | Step 5 で **`git add` 済み** が前提 |
-| `--worktree` | `git diff HEAD` | Edit で working tree 修正済みなのでそのまま反映される |
+| default / `BASE_BRANCH` | `git diff origin/<base>...HEAD` | Commit fixes **before** re-sweep (working tree fix not reflected if HEAD doesn't move) |
+| `--staged` | `git diff --cached` | Step 5 **`git add` done** prerequisite |
+| `--worktree` | `git diff HEAD` | Working tree fix done by Edit, reflected as-is |
 
-残違反がゼロになるまで Step 3〜5 を繰り返す (最大 3 回。それでも残るなら手動判断が必要としてユーザーに報告)。default / `BASE_BRANCH` モードで commit を挟むことで PR にも順次反映される (push は別途必要)。
+Repeat Steps 3-5 until zero remaining violations (max 3 times; if still remain, report to user that manual judgment needed). For default / `BASE_BRANCH` mode, interleaving commits makes PR reflect progressively (push separate).
 
-## 違反パターンの具体例
+## Concrete violation pattern examples
 
-### IDENTIFIER_PARAPHRASE (削除推奨)
+### IDENTIFIER_PARAPHRASE (recommend delete)
 
 ```go
-// 悪い例: 識別子名を日本語で言い換えただけ
-// UserSignupToken は signup 確認用トークンの永続化モデル
+// Bad example: just rephrasing identifier name
+// UserSignupToken is a persistence model of signup confirmation token
 type UserSignupToken struct { ... }
 
-// 良い例: コメント削除
+// Good example: delete comment
 type UserSignupToken struct { ... }
 ```
 
-### NEXT_CODE_WHAT (削除推奨)
+### NEXT_CODE_WHAT (recommend delete)
 
 ```go
-// 悪い例
-// 重複チェック用の既存ユーザーを登録。
+// Bad example
+// Register existing user for duplicate check.
 existingUser := testutil.AddTestUser(...)
 
-// 良い例
+// Good example
 existingUser := testutil.AddTestUser(...)
 ```
 
-### CHANGE_HISTORY (削除推奨)
+### CHANGE_HISTORY (recommend delete)
 
 ```typescript
-// 悪い例
-// Copilot 指摘: signup verify は user/token 作成と session 発行を同一 tx で行う設計上、
-// session 発行失敗で users/signup_token 行が rollback される
+// Bad example
+// Copilot finding: signup verify design requires user/token creation and session issue in same tx,
+// so users/signup_token row rolls back on session issue failure
 function verifySignup() { ... }
 
-// 良い例: WHY だけ残す or 削除
-// 同一 tx で発行: 中途半端な行残存を防ぐため
+// Good example: keep WHY only or delete
+// Issue in same tx: prevent incomplete row remnants
 function verifySignup() { ... }
 ```
 
-### BLOCK_TOO_LONG (圧縮可能なケースのみ違反)
+### BLOCK_TOO_LONG (violation only if compressible)
 
 ```go
-// 悪い例 (5 行で WHY 1 行に圧縮できる)
-// 仕様上はここに到達しない: logout endpoint は AuthMiddleware 配下で
-// session_id Cookie の検証 (構文 + DB 存在 + 期限) を通った後に呼ばれるため、
-// session ID 文字列は valid なはず。形だけ defensive に nil を返すが、
-// AuthMiddleware を経由しないリファクタが入った時に sessions が掃除されない
-// 経路に変質しないよう注意。
+// Bad example (5 lines compressible to 1-line WHY)
+// Per spec unreachable here: logout endpoint under AuthMiddleware
+// called after session_id Cookie validation (syntax + DB exists + expiry),
+// so session ID string should be valid. Defensively return nil,
+// but pay attention that if refactor bypasses AuthMiddleware, sessions won't be cleaned
+// and the behavior changes.
 return nil
 
-// 良い例 1: 削除 (到達不能なら error を返すべき。コメントではなくコードで表現)
+// Good example 1: delete (unreachable should return error, express in code not comment)
 return errors.New("unreachable: logout outside AuthMiddleware")
 
-// 良い例 2: WHY 1 行 (削除できない場合)
-// AuthMiddleware 配下でのみ呼ばれる前提のため不変条件として nil 返却
+// Good example 2: 1-line WHY (when delete impossible)
+// Prerequisite of only being called under AuthMiddleware, so nil return as invariant
 return nil
 ```
 
-3 行以上でも `code-comments.md` の「書く価値がある WHY の例」に該当する場合 (例: 圧縮するとトレードオフの説明が失われる仕様外制約) は `NO_VIOLATION` として残す。
+Even 3+ lines remain as `NO_VIOLATION` if matching "WHY worth writing examples" in `code-comments.md` (example: compressing loses tradeoff explanation for spec-external constraint).
 
-### DUPLICATE_SENTENCE (1 文に集約)
+### DUPLICATE_SENTENCE (consolidate to 1 sentence)
 
 ```go
-// 悪い例 (同じ要旨を 3 回言い換え)
-// password 変更で credentials が変わるため既存 session を全 invalidate する
-// 盗まれた session が継続利用されないよう
-// reset 完了後はすべてのデバイスから再ログインを要求する
+// Bad example (rephrases same essence 3 times)
+// password change changes credentials, invalidate all existing sessions
+// prevent stolen session continued use
+// reset complete requires re-login from all devices
 
-// 良い例
-// password 変更で既存 session を全 invalidate (盗難 session の継続利用防止)
+// Good example
+// password change invalidates all existing sessions (prevent stolen session continued use)
 ```
 
-### NO_VIOLATION (残す)
+### NO_VIOLATION (keep)
 
 ```go
-// 仕様外制約: gorm.DeletedAt を持たない (持つと暗黙的に soft delete に切り替わり hashed_password を含む行が残存する)
+// Spec-external constraint: no gorm.DeletedAt (with it, implicitly switches to soft delete, hashed_password row persists)
 type User struct { ... }
 
-// timing attack 防止: constant-time compare
+// timing attack prevention: constant-time compare
 if subtle.ConstantTimeCompare(a, b) == 1 { ... }
 ```
 
-## PR 作成 flow への統合
+## Integration into PR creation flow
 
-[CLAUDE.md](../../../CLAUDE.md)「コミット / PR 運用」の autonomy 連鎖で `gh pr create` の**直前**に default モードで呼ぶ。`/pr-codex-ci` 起動前に sweep を通すことで、codex review がコメント関連 nit に時間を使わずに本質的な指摘に集中できる。
+In the autonomy chain of "Commit / PR Operations" in [CLAUDE.md](../../../CLAUDE.md), call in default mode **immediately before** `gh pr create`. Running sweep before starting `/pr-codex-ci` lets codex review focus on substantive findings instead of spending time on comment-related nits.
 
-## トラブルシューティング
+## Troubleshooting
 
-| 問題 | 対処 |
+| Issue | Resolution |
 |------|------|
-| `git symbolic-ref refs/remotes/origin/HEAD --short` が失敗 | `git remote set-head origin -a` で再設定。それでも失敗なら明示引数 (`BASE_BRANCH`) を要求 |
-| diff が空 | base 指定ミス (feature branch upstream を渡していないか確認) または HEAD が base に追いついている。`git log --oneline <base>...HEAD` で範囲を確認 |
-| 違反テーブルが大量 (>20 件) | レガシーファイルを含む大規模差分の可能性。base を見直すか、ファイル単位で分割実行 |
-| 周辺コード読み込みが多くて遅い | 同じファイル複数違反はまとめて Read。LLM 判定は 1 ファイル単位でバッチ化 |
-| 修正後に lint / formatter が走って再差分 | 再 sweep 時に新たな違反として誤検出しないよう、formatter 自動修正分は無視 (空白だけの diff は除外) |
-| `rules/code-comments.md` 自身を編集中 | 規範記述の例コメント (`// 悪い例` 等) を違反としない (Step 2 の除外ルール) |
-| `--worktree` モードで新規ファイルが拾われない | `git diff HEAD` は tracked のみ。事前に `git add -N <path>` で intent-to-add してから再実行 |
-| bun が PATH 上にない | 生成ファイル検出ステップを skip して全ファイルを sweep 対象とする (本 skill の核機能は影響なし) |
+| `git symbolic-ref refs/remotes/origin/HEAD --short` fails | Reconfigure with `git remote set-head origin -a`. If still fails, request explicit argument (`BASE_BRANCH`) |
+| Diff empty | Base specification error (check if passing feature branch upstream) or HEAD caught up with base. Verify range with `git log --oneline <base>...HEAD` |
+| Violation table huge (>20) | Possibility of large diff including legacy files. Reconsider base or split per-file execution |
+| Slow due to heavy surrounding code reads | For multiple violations in same file, batch Read. LLM judgment batch per-file |
+| Lint / formatter runs post-fix creating re-diff | Don't false-positive during re-sweep, ignore formatter auto-fix (exclude whitespace-only diffs) |
+| Editing `rules/code-comments.md` itself | Don't treat example comments in norm description (`// bad example` etc) as violations (Step 2 exclusion rule) |
+| New files not picked up in `--worktree` mode | `git diff HEAD` tracked only. First `git add -N <path>` for intent-to-add, then re-run |
+| bun not in PATH | Skip generated file detection step, include all files in sweep targets (core skill function unaffected) |
 
-## 根拠
+## Rationale
 
-判定基準は [rules/code-comments.md](../../../rules/code-comments.md) を SoT とし、本スキルは**判定タイミング** (PR 作成前 / commit 前) を強制する。LLM のコメント生成は context window 圧縮で CLAUDE.md 規範が薄れて再現性が落ちるため、**deterministic な発火点**として skill 化している。
+Judgment criteria use [rules/code-comments.md](../../../rules/code-comments.md) as SoT; this skill enforces **judgment timing** (before PR creation / before commit). LLM comment generation loses CLAUDE.md norm reproducibility through context window compression, so skill-ified as **deterministic trigger point**.

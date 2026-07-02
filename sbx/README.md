@@ -1,139 +1,139 @@
-# sbx カスタム image / kit
+# sbx Custom Image / Kit
 
-[Docker Sandboxes (`sbx`)](https://docs.docker.com/ai/sandboxes/) で coding agent を **microVM-per-agent の hypervisor 境界**の中で動かすための、playbook の実行基盤。安全に並列化した coding agent / HOTL (Human-On-The-Loop) 運用の土台。
+The execution foundation of the playbook for running coding agents inside **microVM-per-agent hypervisor boundaries** with [Docker Sandboxes (`sbx`)](https://docs.docker.com/ai/sandboxes/). Foundation for safely parallelized coding agent / HOTL (Human-On-The-Loop) operations.
 
-中立な `shell-docker` base の image に **claude と codex を同居**させ、**built-in claude agent** で起動して箱の中で claude が codex を呼んで**相互レビュー**できる構成。採用に至った検証と方針は [docs/decisions/parallel-hotl-execution.md](../docs/decisions/parallel-hotl-execution.md)（Accepted）を参照。
+A configuration where **claude and codex coexist** in a neutral `shell-docker` base image, launched with **built-in claude agent** so claude inside the box can call codex for **mutual review**. For verification and rationale that led to this design, see [docs/decisions/parallel-hotl-execution.md](../docs/decisions/parallel-hotl-execution.md) (Accepted).
 
-## なぜ sbx か（hard boundary）
+## Why sbx? (hard boundary)
 
-自作 firewall ベースのサンドボックス（旧 `.devcontainer/`、撤去済み）は defense-in-depth であって hard boundary ではない（箱内の `node` が root sudo / docker 権限を持ち、乗っ取られた agent が egress を破壊しうる）。承認ゲートを外して並列で回す HOTL では監視が薄くなるため soft boundary は構造的に不足する。sbx は microVM-per-agent の hypervisor 境界を中核とし、VM 内 root でも破れない hard boundary を持つ。
+Custom firewall-based sandboxes (old `.devcontainer/`, removed) are defense-in-depth, not hard boundaries (the `node` inside the box has root sudo / docker privileges, so a compromised agent can breach egress). HOTL with approval gates removed and parallel execution has thin monitoring, so soft boundaries are structurally insufficient. sbx centers on microVM-per-agent hypervisor boundaries and has hard boundaries that can't be broken even by VM-internal root.
 
-## なぜ built-in claude agent + codex mixin か
+## Why built-in claude agent + codex mixin?
 
-secret の proxy 注入（トークンを box に入れず host で auth header を注入）は **agent positional が Docker built-in agent に解決される時だけ** sbx が host 側で provisioning する。custom (`kind: sandbox`) agent では claude / codex とも secret の placeholder が登録されず proxy 注入が効かない（実機検証で確認）。なお **anthropic で proxy 注入の対象になるのは API key のみ**で、サブスク (Pro/Max) は proxy 注入ではなく箱内 `/login`、または `claude setup-token` を `sbx secret set` に登録して box に自動 provision させる経路 C で認証する（いずれもトークンは box 内に入る。後述「認証」）。そこで:
+Secret proxy injection (injecting auth header on host without putting tokens in box) **is provisioned by sbx on host only when agent position resolves to Docker built-in agent**. With custom (`kind: sandbox`) agents, neither claude nor codex have secret placeholders registered, so proxy injection doesn't work (confirmed by live testing). Note: **with anthropic, only API keys are proxy-injection targets**; subscriptions (Pro/Max) authenticate not via proxy injection but via `/login` inside the box or by registering `claude setup-token` with `sbx secret set` for route C to auto-provision in box (either way, tokens end up in box—see "Authentication" below). Thus:
 
-- **base image は中立な `shell-docker`**（`claude-code-docker` を base にすると claude が特権化する）。claude / codex / chrome を image に bake し、`-t` で渡す。
-- **agent は built-in `claude`**（`sbx run claude`）。built-in agent だと sbx が secret を proxy 注入できる（**API key** は host で auth header を注入しトークンは box に入らない）。**サブスク (Pro/Max) は proxy 注入ではなく箱内 `/login` か setup-token の secret 登録（経路 C）で認証し、その OAuth トークンは box 内に保存される**（後述「認証」）。
-- **codex は mixin（`playbook-kit/`）で egress だけ開け**、サブスク認証は **host の `~/.codex/auth.json` を box に転送**して codex に実トークンを直接渡す（後述「codex のサブスク認証」）。codex の proxy 注入は built-in codex agent 限定で claude box では効かないため。
-- `shell-docker` は共通 base `shell` に **Docker Engine (DinD) を足した variant**。playbook は箱内 compose を使う（[ADR](../docs/decisions/parallel-hotl-execution.md) 受け入れ項目）ため `-docker` 系統が必要。DinD は sbx が `-docker` 系統に対し privileged microVM + block volume + dockerd 自動起動を用意するもので、**素の `shell` に手で docker を足しても付かない**。
+- **Base image is neutral `shell-docker`** (using `claude-code-docker` as base would privilege claude). Bake claude / codex / chrome into image and pass with `-t`.
+- **Agent is built-in `claude`** (`sbx run claude`). With built-in agent, sbx can proxy-inject secrets (**API key** gets auth header injected on host, token doesn't enter box). **Subscriptions (Pro/Max) authenticate not via proxy injection but via `/login` inside box or setup-token secret registration (route C), with OAuth token stored in box** (see "Authentication" below).
+- **Codex is a mixin (`playbook-kit/`) that only opens egress**; subscription authentication **transfers host `~/.codex/auth.json` to box** and passes real tokens directly to codex (see "codex subscription authentication" below). Codex proxy injection works only with built-in codex agent, not in claude boxes.
+- `shell-docker` is a variant of common base `shell` **with Docker Engine (DinD) added**. Playbook uses compose inside boxes ([ADR](../docs/decisions/parallel-hotl-execution.md) acceptance criterion), so `-docker` lineage is needed. DinD is sbx providing privileged microVM + block volume + dockerd auto-start for `-docker` lineage; **manually adding docker to raw `shell` doesn't give DinD**.
 
-## 前提
+## Prerequisites
 
-- host に `sbx` CLI（Docker Sandboxes）を導入し、`sbx login` で認証済みであること
-- Docker が動いていること
+- Host has `sbx` CLI (Docker Sandboxes) installed and authenticated with `sbx login`
+- Docker is running
 
-## image をビルド + sbx へ load
+## Build image + load into sbx
 
 ```bash
-docker build --load -t coding-agent-playbook-sbx sbx/   # --load: BUILDX_BUILDER non-default driver でも local image store に入れる
-docker save coding-agent-playbook-sbx -o cap-sbx.tar    # sbx runtime に渡すため tar 化
-sbx template load cap-sbx.tar                           # sbx の template store に取り込む
+docker build --load -t coding-agent-playbook-sbx sbx/   # --load: enters local image store even with non-default BUILDX_BUILDER driver
+docker save coding-agent-playbook-sbx -o cap-sbx.tar    # tar for sbx runtime
+sbx template load cap-sbx.tar                           # import into sbx template store
 ```
 
-base は `docker/sandbox-templates:shell-docker`（中立 base・DinD 入り）。これに workshop 用ツール（fonts / headless Chromium）と chrome-devtools MCP 用の chrome-headless ラッパー + CDP 環境変数（`CDP_EXEC` / `CDP_HEADLESS`）、および **claude / codex を公式 standalone installer で対等に** bake する。install は build 時に host network で走るため egress allowlist の影響を受けず、box の runtime egress を tight に保てる。
+Base is `docker/sandbox-templates:shell-docker` (neutral base, includes DinD). Add workshop tools (fonts / headless Chromium) and chrome-headless wrapper for chrome-devtools MCP + CDP env vars (`CDP_EXEC` / `CDP_HEADLESS`), and **bake claude / codex from official standalone installers on equal footing**. Install runs on host network at build time, unaffected by runtime egress allowlist, keeping box runtime egress tight.
 
-box 内の claude は既定モデルを **Opus** にしてある（image に `ENV ANTHROPIC_MODEL=opus` を焼く）。`opus` alias は常に最新 Opus を指す。image 側に焼くので **host 側 claude には影響しない**（box-only）。`~/.claude/settings.json` の `model` field でなく env に焼くのは、built-in claude agent が起動時に settings.json を自前で書き直し焼いた `model` を落とすため（実機確認済み）。box には `--model` も他の `ANTHROPIC_MODEL` も渡らないので、この env が precedence 上唯一の権威として効く。箱内で `/model` を叩けば現 session は即座に切り替わる（`/model` は env より優先）が、box は基本使い捨て 1 session なので env 既定で実害は無い。
+Claude inside box has default model set to **Opus** (baked in image as `ENV ANTHROPIC_MODEL=opus`). The `opus` alias always points to latest Opus. Since it's baked in image, **doesn't affect host-side claude** (box-only). Baking in env instead of `~/.claude/settings.json`'s `model` field because built-in claude agent rewrites settings.json on startup and drops the baked `model` (confirmed in testing). Box gets no `--model` or other `ANTHROPIC_MODEL`, so this env has sole precedence authority. Running `/model` inside box switches current session immediately (`/model` takes priority over env), but boxes are basically disposable single-sessions, so no real harm from env default.
 
-> ⚠️ **`sbx template load` は必須**。sbx の Docker daemon は host の local image store を共有せず registry から pull するため、`docker build` しただけの local image は box 作成時に `pull failed` になる（[Templates doc](https://docs.docker.com/ai/sandboxes/customize/templates/)）。Dockerfile を変更したら再 build → 再 save → 再 load する。
+> ⚠️ **`sbx template load` is required**. sbx's Docker daemon doesn't share host's local image store and pulls from registry; a local image from just `docker build` fails with `pull failed` on box creation ([Templates doc](https://docs.docker.com/ai/sandboxes/customize/templates/)). If Dockerfile changes, rebuild → re-save → re-load.
 
-> ℹ️ **agent の version を上げたいだけのとき**（Dockerfile は不変で claude / codex を最新版に更新したい）は、installer の `RUN` 文字列が変わらず Docker が cache hit して**古い版に固定される**。`AGENT_CACHEBUST` ARG（installer レイヤーの直前に置いてある）の値を変えて build すると、その install レイヤーだけ cache を捨てて再取得する:
+> ℹ️ **When only updating agent version** (Dockerfile unchanged, just updating claude / codex to latest): the installer `RUN` string doesn't change and Docker cache-hits, **locking to old version**. Change `AGENT_CACHEBUST` ARG (placed right before installer layer) value and rebuild to skip that install layer's cache and refetch:
 >
 > ```bash
 > docker build --load --build-arg AGENT_CACHEBUST=$(date +%s) -t coding-agent-playbook-sbx sbx/
 > docker save coding-agent-playbook-sbx -o cap-sbx.tar && sbx template load cap-sbx.tar
 > ```
 >
-> （`bash scripts/build-image.sh` / `scripts/build-image.ps1` でこの 2 行を 1 行に縮約できる）
+> (`bash scripts/build-image.sh` / `scripts/build-image.ps1` condenses these 2 lines to 1)
 >
-> 上流の重い apt / Chromium レイヤーは ARG より前なので cache 再利用される（`--no-cache` 全再ビルドより速い）。
+> Upstream heavy apt / Chromium layers before ARG reuse cache (faster than `--no-cache` full rebuild).
 
-## 認証
+## Authentication
 
 ### claude
 
-claude には **3 経路**がある。サブスク (Pro/Max) を**複数 box / 並列**で回すなら **経路 C（setup-token、per-box 操作なしで全 box 自動認証）が推奨**。単発 box の手早い起動なら経路 B（箱内 `/login`）。トークンを box に入れたくない (最小化) なら経路 A（API key）。経路 B / C はトークンが box 内に入る。
+Claude has **3 routes**. For running subscriptions (Pro/Max) **across multiple boxes / in parallel**, **route C (setup-token, all-boxes auto-auth without per-box ops) is recommended**. For quick one-off box startup, route B (`/login` inside box). To keep tokens out of box (minimize), route A (API key). Routes B / C put tokens in box.
 
-#### 経路 A: API key（proxy 注入・トークンは box に入らない）
+#### Route A: API key (proxy injection, token stays off box)
 
 ```bash
-sbx secret set -g anthropic   # API key (sk-ant-...) を貼る
+sbx secret set -g anthropic   # Paste API key (sk-ant-...)
 ```
 
-built-in claude agent が API key を proxy 注入する。secret は host keychain に保存され、box 内は sentinel 値のみ（`SBX_CRED_ANTHROPIC_MODE=apikey`、実トークンは box に入らない）。
+Built-in claude agent proxy-injects API key. Secret is stored in host keychain; box only gets sentinel value (`SBX_CRED_ANTHROPIC_MODE=apikey`, real token never enters box).
 
-#### 経路 B: サブスク (Pro/Max)（箱内 `/login`・トークンは box 内）
+#### Route B: Subscription (Pro/Max) (`/login` in box, token in box)
 
-**`sbx secret set -g anthropic --oauth` の対話 OAuth フローは使えない**（`anthropic OAuth cannot be started from sbx secret set; sign in from inside the Claude sandbox` で拒否、v0.33.0 で確認）。サブスクを secret 登録して全 box 自動認証したい場合は `claude setup-token` のトークンを貼る経路 C を使う。単発 box は箱内で `/login` する:
+**Interactive OAuth flow from `sbx secret set -g anthropic --oauth` is not available** (rejected with `anthropic OAuth cannot be started from sbx secret set; sign in from inside the Claude sandbox`, confirmed v0.33.0). To auto-authenticate all boxes via secret registration, use route C with `claude setup-token` token. For one-off boxes, `/login` inside:
 
 ```bash
-sbx run <box>      # claude が起動したら /login (claude.ai OAuth、対話)
+sbx run <box>      # Once claude starts, do /login (claude.ai OAuth, interactive)
 ```
 
-完了すると OAuth トークンは **box 内 `~/.claude/.credentials.json` に保存される**（codex の auth.json と同じく box 内に実トークンが置かれる）。経路 A と違い token-not-in-box の性質は無く、下記 codex と同じ security トレードオフが claude にも生じる。
+On completion, OAuth token is **stored in box at `~/.claude/.credentials.json`** (like codex's auth.json, real tokens end up in box). Unlike route A, there's no token-not-in-box property; codex's security tradeoff applies to claude too.
 
-#### 経路 C: サブスク + setup-token（secret 登録で全 box 自動認証・**複数 box / 並列で推奨**）
+#### Route C: Subscription + setup-token (secret registration for all-box auto-auth, **recommended for multiple boxes / parallel**)
 
-経路 B の `/login` は box ごとに対話が要る。複数 box を並列で回すなら、**サブスクの長期トークンを一度 secret に登録**しておけば、以降の新規 box は作成時に認証が自動で入る:
+Route B's `/login` requires interaction per box. For parallel multi-box, **register subscription's long-lived token once in secret**, then new boxes auto-auth on creation:
 
 ```bash
-claude setup-token             # host で 1 回 (対話・ブラウザ)。長期トークン sk-ant-oat01-... が出る
-sbx secret set -g anthropic    # 出たトークンを貼る (sbx は sk-ant-oat... を OAuth として登録する)
+claude setup-token             # Once on host (interactive, browser). Outputs long-lived token sk-ant-oat01-...
+sbx secret set -g anthropic    # Paste the token (sbx registers sk-ant-oat... as OAuth)
 ```
 
-`sbx secret ls` が `anthropic (oauth configured)` を示せば登録完了。以降 `sbx create` / `sbx run` した box は **作成時に `~/.claude/.credentials.json` が自動生成**され、`/login` も cp も無しで claude が通る（実機確認: oauth secret 登録後の新規 box で `claude -p` が認証成功）。
+`sbx secret ls` showing `anthropic (oauth configured)` means registration is done. Subsequent `sbx create` / `sbx run` boxes **auto-generate `~/.claude/.credentials.json` at creation**, and claude works without `/login` or manual cp (confirmed: `claude -p` succeeds on new box after oauth secret registration).
 
-- **per-box の操作ゼロ**: 経路 B の box ごと `/login` も、credentials の手動 cp も不要
-- **トークンは box 内**: 自動生成される credentials は box の filesystem に入る（経路 B と同じ security トレードオフ）。box の access token は短命（~数時間）で refresh され、土台の長期 setup-token が secret（host keychain）側に残る
-- サブスク維持（経路 A の API key と違い API 課金にならない）
+- **Zero per-box operations**: No box-by-box `/login` from route B, no manual credentials cp
+- **Token in box**: Auto-generated credentials go on box filesystem (same security tradeoff as route B). Box access tokens are short-lived (~hours) and refresh; underlying long-lived setup-token stays in secret (host keychain)
+- Keeps subscription active (unlike route A's API key, no API billing)
 
-> ⚠️ `sbx secret set -g anthropic` に貼るのは **setup-token (`sk-ant-oat01-...`)**。API key (`sk-ant-api...`) を貼ると経路 A（apikey mode・proxy 注入）になる。`--oauth` フラグは anthropic では使えない（経路 B 参照）。
-> ⚠️ **未検証**: 多数 box での長時間並列における refresh token のローテーション挙動はストレステストしていない。setup-token は box ごとに独立 mint される想定だが、並列で 401 が出る場合は box ごとに別アカウントか経路 A（API key）にする。
+> ⚠️ What you paste to `sbx secret set -g anthropic` is **setup-token (`sk-ant-oat01-...`)**. Pasting API key (`sk-ant-api...`) becomes route A (apikey mode, proxy injection). The `--oauth` flag doesn't work with anthropic (see route B).
+> ⚠️ **Untested**: refresh token rotation behavior under heavy parallel multi-box sustained load is not stress-tested. Setup-token is assumed minted independently per box, but if parallel 401s occur, use separate accounts per box or route A (API key).
 
-### codex（サブスク、auth.json 転送）
+### codex (subscription, auth.json transfer)
 
-codex の OAuth は claude box では proxy 注入されないため、host の実トークンを box に転送する:
+Codex OAuth is not proxy-injected in claude boxes, so transfer real tokens from host to box:
 
 ```bash
-# 1. host で codex にサブスクログイン (ブラウザ)。~/.codex/auth.json が実トークンを持つ
+# 1. On host, subscribe-login to codex (browser). ~/.codex/auth.json holds real token
 codex login
 
-# 2. box 作成後、auth.json を box に転送して agent 所有にする
-#    (kit は startup で .codex を作らないので、転送先 dir を先に用意する)
+# 2. After box creation, transfer auth.json to box and give agent ownership
+#    (kit doesn't create .codex on startup, so prepare destination dir first)
 sbx exec <box> sudo install -d -o 1000 -g 1000 /home/agent/.codex
 sbx cp ~/.codex/auth.json <box>:/home/agent/.codex/auth.json
 sbx exec <box> sudo chown 1000:1000 /home/agent/.codex/auth.json
 ```
 
-codex は転送した auth.json の実トークンで `chatgpt.com/backend-api/codex` に直接話し、`auth.openai.com` で自動 refresh する（mixin が両 host への egress を許可、serviceAuth は付けず proxy が auth header を触らないようにしている）。
+Codex talks directly to `chatgpt.com/backend-api/codex` with real tokens from transferred auth.json, auto-refreshing at `auth.openai.com` (mixin allows egress to both hosts, no serviceAuth so proxy doesn't touch auth headers).
 
-> ⚠️ **並列 box の制約**: 同じ `auth.json` を複数 box に転送して並走させると、ある box の token refresh で OAuth provider が **refresh token を rotate** し、他 box / host 側の古い refresh token が invalid になって 401 になりうる。codex を安定して並列実行したい場合は box ごとに別アカウント、または下記の API key 経路にする。
+> ⚠️ **Parallel box constraint**: transferring same `auth.json` to multiple boxes and running parallel, OAuth provider **rotates refresh token** on one box's token refresh, invalidating other boxes' / host's old refresh tokens → 401s. For stable codex parallel execution, use separate account per box or API key route below.
 
-> ⚠️ **security トレードオフ**: auth.json 転送は **codex の実トークン（refresh token 含む）を box の filesystem に置く**。sbx の secret-proxy 分離（secret を box に入れない）を一段緩めるため、乗っ取られた agent がトークンを読み出し/exfil しうる（→ ChatGPT サブスクアカウントへの持続的アクセス）。microVM の hard boundary 自体は不変。claude を**経路 A（API key）**にすれば claude のトークンは box に入らず、box 内の実トークンは codex の 1 つに最小化される（**サブスク経路 B（`/login`）/ C（setup-token）だと claude のトークンも box 内に入る**ため最小化は効かない）。疑わしい挙動時は box 内に置いた実トークンを rotate する: codex は host で ChatGPT を sign out / 再 login、claude をサブスク経路で使っていれば claude.ai でセッションを revoke し、**既存の各 box の `~/.claude/.credentials.json` を破棄（box を作り直す）する**（host secret の更新は今後 provision される box にしか効かず、既存 box に配られたトークンは別途無効化が要る。経路 C なら host で `claude setup-token` を再発行して古いトークンを provider 側で失効させたうえで secret を差し替える ※ 再発行で既存 box 分が一括失効するかは未検証）。課金を分離して安全側に倒すなら codex を OpenAI **API key** にする手もある（その場合は mixin に openai の `serviceDomains`/`serviceAuth` を足して `OPENAI_API_KEY` を proxy 注入する。auth.json 転送は不要になる）。
+> ⚠️ **Security tradeoff**: auth.json transfer **puts codex's real tokens (including refresh tokens) on box filesystem**. Loosens sbx's secret-proxy separation (keeping secrets off boxes), so compromised agents can read/exfil tokens → persistent access to ChatGPT subscription account. Hard boundary of microVM itself is unchanged. Using claude on **route A (API key)** keeps claude's tokens off boxes, minimizing real tokens in box to codex alone (**subscription routes B (`/login`) / C (setup-token) put claude tokens in box too**, so minimization doesn't work). On suspicious behavior, rotate real tokens placed in box: codex—sign out / re-login ChatGPT on host; claude on subscription routes—revoke session on claude.ai; **destroy each box's `~/.claude/.credentials.json` (recreate boxes)** (host secret updates only affect future-provisioned boxes; existing boxes' distributed tokens need separate revocation. Route C: re-issue `claude setup-token` on host to expire old token on provider side, then swap secret ※ whether re-issuance bulk-expires existing boxes is untested). For split billing and safer stance, use OpenAI **API key** for codex (then add openai's `serviceDomains`/`serviceAuth` to mixin and proxy-inject `OPENAI_API_KEY`. Auth.json transfer becomes unnecessary).
 
-> ⚠️ global secret（`-g`）は **box 作成時に反映**される。set/変更したら box を作り直す。
+> ⚠️ Global secrets (`-g`) **take effect at box creation**. After set/change, recreate boxes.
 
-## box-primary（基本: 箱の中で回す）
+## box-primary (Basic: run inside box)
 
-repo ルートで、built-in claude agent + image + codex mixin で起動する:
+From repo root, launch with built-in claude agent + image + codex mixin:
 
 ```bash
 sbx run claude -t coding-agent-playbook-sbx --kit ./sbx/playbook-kit .
 ```
 
-- agent = built-in `claude`（YOLO `--dangerously-skip-permissions` は built-in claude の entrypoint に組込み済み）。claude が driver で codex を shell out して相互レビューする。
-- codex を使う前に上記「codex のサブスク認証」の auth.json 転送を行う。
-- `playbook-kit/` は codex egress を足す mixin。kit を変更したら box を作り直す（`sbx rm <name>`）。
+- agent = built-in `claude` (YOLO `--dangerously-skip-permissions` is baked into built-in claude entrypoint). Claude is driver, shells out to codex for mutual review.
+- Before using codex, do auth.json transfer from "codex subscription auth" above.
+- `playbook-kit/` is mixin that adds codex egress. If kit changes, recreate box (`sbx rm <name>`).
 
-## 並列（複数 box で別タスク）
+## Parallel (multiple boxes for separate tasks)
 
-複数 box を並走させるときは **`sbx create`（非対話で作成）→ `sbx run <name>`（attach）の 2 段階**で行う:
+When running multiple boxes in parallel, use **`sbx create` (non-interactive creation) → `sbx run <name>` (attach) in 2 stages**:
 
 ```bash
 sbx create --name box1 claude -t coding-agent-playbook-sbx --kit ./sbx/playbook-kit --clone .
 sbx create --name box2 claude -t coding-agent-playbook-sbx --kit ./sbx/playbook-kit --clone .
 ```
 
-作成後、それぞれ別ターミナルで attach する:
+After creation, attach from separate terminals:
 
 ```bash
 sbx run box1
@@ -143,34 +143,34 @@ sbx run box1
 sbx run box2
 ```
 
-- `--clone` = 箱内で repo を private clone（各 box が独立した作業コピーを持ち、並列で衝突しない）。各 box の commit は host 側の `sandbox-<name>` git remote から回収できる
-- 同一 repo の `--clone` box は複数並存できる
-- claude サブスクを並列で使うなら **経路 C（setup-token を secret 登録）が楽**: 各 box が作成時に credentials を自動取得するので box ごとの操作が要らない。経路 B（`/login`）を使う場合は box ごとに attach 後 login が要る（「認証」参照）
-- codex を使う box ごとに auth.json 転送が要る
+- `--clone` = private clone of repo inside box (each box has independent working copy, no collision in parallel). Each box's commits can be recovered from host-side `sandbox-<name>` git remotes
+- Multiple `--clone` boxes of same repo can coexist
+- For parallel claude subscriptions, **route C (register setup-token as secret) is easiest**: each box auto-fetches credentials on creation, no per-box operations. Using route B (`/login`) requires login per box after attach (see "Authentication")
+- Each codex-using box requires auth.json transfer
 
-## HOTL 監視（host から箱を覗く）
+## HOTL Monitoring (peek at box from host)
 
-箱内 agent を走らせたまま、host から介入せず状態だけ見る:
+Let agent inside box run while host just observes without intervening:
 
 ```bash
-sbx ls                                    # 走行状況 / published ports
-sbx exec box1 sh -c 'git -C /run/sandbox/source log --oneline -8'   # 進捗を read-only に覗く
+sbx ls                                    # Running status / published ports
+sbx exec box1 sh -c 'git -C /run/sandbox/source log --oneline -8'   # Peek at progress read-only
 ```
 
-箱内 dev server を host のブラウザで見る（escape hatch）:
+View dev server inside box from host browser (escape hatch):
 
 ```bash
 sbx ports box1 --publish 3000
 ```
 
-published された host `127.0.0.1:<port>` を host の Chrome で開く。`--clone` 時の repo は箱内 `/run/sandbox/source`。
+Open published host `127.0.0.1:<port>` in host's Chrome. `--clone` repo is at `/run/sandbox/source` in box.
 
-複数 box の dev server を `web.box1.localhost` / `web.box2.localhost` のように**名前で見分ける**には、publish した host port を Traefik の file provider で振り分ける（port 番号を人が覚えなくて済む）。実動 config と手順は [../tools/parallel-dev/box-routing/](../tools/parallel-dev/box-routing/README.md) 参照。
+To **distinguish dev servers of multiple boxes by name** like `web.box1.localhost` / `web.box2.localhost`, route published host ports via Traefik file provider (avoids remembering port numbers). Production config and steps: [../tools/parallel-dev/box-routing/](../tools/parallel-dev/box-routing/README.md).
 
-## 落とし穴
+## Gotchas
 
-- **`shell` agent への mismatch 警告は想定内**: `sbx create` / `sbx run claude` で `template "coding-agent-playbook-sbx" was built for the "shell" agent but you are using "claude"` が出るが正常。この template の flavor は base 由来の `shell-docker`（中立 base を意図的に選択。`sbx template ls` の FLAVOR 列で確認できる）で、それを built-in `claude` agent で起動するため、sbx の flavor↔agent 整合チェックに引っかかって一般的な注意文を出すだけ（実害の検知ではない）。box は claude agent で正常起動している（`sbx ls` の AGENT 列が `claude`）。警告が促す `sbx run -t ... shell` には**従わない**（shell agent で入ると claude が driver にならず、built-in claude agent 限定の secret proxy 注入も効かなくなる）。
-- **コールド起動の transient**: `stopped` の box を `sbx exec` で叩き起こした直後は egress proxy / 箱内 Docker daemon が温まりきっておらず、最初の数秒は egress timeout や DinD コマンド失敗が出ることがある。温まった後は安定する（恒久的な失敗と区別すること）
-- **egress allowlist**: 箱内 runtime は default-deny + allowlist（`api.anthropic.com` / `**.github.com` / `registry.npmjs.org` / `docker.io` 等は許可、それ以外は proxy が 403 で能動拒否）。codex 用の `chatgpt.com` / `auth.openai.com` は mixin の `network.allowedDomains` で開ける。build は host network で走るため installer の取得には影響しない
-- **nested egress も遮断**: 箱内 Docker で起動した container の直接 egress も VM 境界で遮断され、allowlist を bypass できない
-- **box 内に置かれる実トークン**: codex の auth.json（常に）と、claude をサブスク経路 B（`/login`）/ C（setup-token）で使う場合の `~/.claude/.credentials.json`。上述の security トレードオフ参照。これらは box の filesystem にあるため box を信頼できない入力に晒さない（claude を経路 A の API key にすれば claude 側は box 内に入らない）
+- **`shell` agent mismatch warning is expected**: `sbx create` / `sbx run claude` shows `template "coding-agent-playbook-sbx" was built for the "shell" agent but you are using "claude"` — normal. This template's flavor is `shell-docker` from base (intentionally selected neutral base; verify in `sbx template ls` FLAVOR column), and launching it with built-in `claude` agent triggers sbx's flavor↔agent consistency check, outputting a generic warning (not real harm detection). Box launches normally with claude agent (`sbx ls` AGENT column shows `claude`). Don't follow warning's suggestion to `sbx run -t ... shell` (**if you enter with shell agent, claude isn't driver and built-in claude agent's secret proxy injection stops working**).
+- **Cold-start transience**: directly after waking stopped box with `sbx exec`, egress proxy / in-box Docker daemon aren't warmed up; first few seconds may see egress timeouts or DinD command failures. After warming, stable (distinguish from permanent failures).
+- **Egress allowlist**: in-box runtime is default-deny + allowlist (`api.anthropic.com` / `**.github.com` / `registry.npmjs.org` / `docker.io` etc allowed, others actively rejected by proxy with 403). Codex's `chatgpt.com` / `auth.openai.com` opened by mixin's `network.allowedDomains`. Build runs on host network, so installer fetching is unaffected.
+- **Nested egress also blocked**: direct egress from containers launched inside box Docker is also blocked at VM boundary, can't bypass allowlist.
+- **Real tokens placed in box**: codex's auth.json (always) and `~/.claude/.credentials.json` when using claude via subscription routes B (`/login`) / C (setup-token). See security tradeoff above. These are on box filesystem, so don't expose box to untrustworthy input (using claude with route A's API key keeps claude off-box).

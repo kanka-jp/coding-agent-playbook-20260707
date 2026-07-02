@@ -1,67 +1,65 @@
-# box persona と権限ティア
+# Box Personas and Permission Tiers
 
-coding agent を **権限ティアごとに別 box / 別 identity に分離**して回すための規約。
-通常開発（write）・AWS 可観測性の調査（read-only）・deploy（host privileged）を**混ぜない**。
-全体の実行モデルは [box-ops.md](box-ops.md)、PR ライフサイクルは [pr-followup.md](pr-followup.md) 参照。
+Conventions for running coding agent **separated by permission tier into distinct boxes / identities**.
+Never mix normal development (write) · AWS observability investigation (read-only) · deploy (host privileged).
+See [box-ops.md](box-ops.md) for overall execution model, [pr-followup.md](pr-followup.md) for PR lifecycle.
 
-## なぜ分けるか（原則）
+## Why Separate (Principles)
 
-業界の SRE/agent セキュリティ実践（AWS DevOps Agent の read-first・Agent Space per environment、
-PagerDuty の Review/Autonomous ゲート、WorkOS の agent identity 分離、CoSAI の JIT 権限、
-Simon Willison の lethal trifecta、Grafana MCP の opt-in read-only）に共通する原則を、本 playbook に写す。
+Apply principles common to industry SRE/agent security practices (AWS DevOps Agent's read-first · Agent Space per environment,
+PagerDuty's Review/Autonomous gate, WorkOS's agent identity isolation, CoSAI's JIT permissions,
+Simon Willison's lethal trifecta, Grafana MCP's opt-in read-only) to this playbook.
 
-- **P1 read-first / write-gated**: 調査(read)は自走、修正・再 deploy(write/remediation)は人間承認。
-- **P2 persona ごとに別 identity・別 credential**: 1 つの広域資格を使い回さない／ユーザー資格を借用しない。
-- **P3 standing 権限を持たせない**: 短命・task-scoped・即失効。長期 full-access key の直焼きはアンチパターン（blast radius）。
-- **P4 read-only の境界は権限層(IAM)で作る**: tool 層(CLI/MCP)に依存しない。read-only は IAM ロールで強制する。
-- **P5 観測データ(ログ本文)は untrusted**: lethal trifecta（private data + untrusted content + external comms）の
-  同時成立を避ける。観測 persona は private data(AWS read) と untrusted content(ログ) を持つので、
-  **external comms を AWS API endpoint のみに絞って** trifecta を崩す。
+- **P1 read-first / write-gated**: Investigation (read) runs autonomously; fixes and re-deploy (write/remediation) require human approval.
+- **P2 distinct identity and credential per persona**: Don't reuse one broad credential / don't borrow user's credential.
+- **P3 no standing privileges**: Short-lived, task-scoped, revoke immediately. Long-term full-access key baked-in is anti-pattern (blast radius).
+- **P4 read-only boundary enforced at permission layer (IAM)**: Not at tool layer (CLI/MCP). Enforce read-only via IAM role.
+- **P5 observational data (log bodies) is untrusted**: Avoid simultaneous occurrence of lethal trifecta (private data + untrusted content + external comms).
+  Observational persona holds private data (AWS read) and untrusted content (logs), so
+  **narrow external comms to AWS API endpoints only** to break trifecta.
 
-## persona マトリクス
+## Persona Matrix
 
-| persona | 実行場所 | repo | git | AWS cred | network | 役割 |
+| persona | execution location | repo | git | AWS cred | network | role |
 |---|---|---|---|---|---|---|
-| **dev box** | sbx microVM | bind-mount (write) | push/PR | なし | github + codex pair + MCP | 通常開発・実装・codex review・PR |
-| **observe box** | sbx microVM | **clone copy**（`dev.sh observe` = `--clone .`。host checkout を mount せず host repo を汚さない＝read-only 相当・push しない。committed runbook を含む） | なし | read-only・短命 session・スコープ済 | **AWS read API endpoint のみ**（CDN 不可） | AWS 可観測性の調査（ログ/状態を読む） |
-| **host** | host | working tree | — | write/deploy | full | deploy/destroy・headful browser 確認・bridge 応答 |
+| **dev box** | sbx microVM | bind-mount (write) | push/PR | none | github + codex pair + MCP | Normal development, implementation, codex review, PR |
+| **observe box** | sbx microVM | **clone copy** (`dev.sh observe` = `--clone .`. No host checkout mount = don't pollute host repo = read-only equivalent, no push. Includes committed runbook) | none | read-only, short-lived session, scoped | **AWS read API endpoint only** (no CDN) | AWS observability investigation (read logs/state) |
+| **host** | host | working tree | — | write/deploy | full | deploy/destroy, headful browser confirmation, bridge responses |
 
-**不変条件**:
-- write/deploy の AWS cred は **host だけ**。observe box は **read-only cred だけ**。dev box は **AWS cred ゼロ**。
-- identity は 3 つに分離（P2）。observe box の cred は **host が mint した短命 session を実行時注入**し、
-  box 内では `AssumeRole` しない（IAM で `sts:AssumeRole` を明示 Deny。credential broker 化を防ぐ。P3）。
-- **アプリ閲覧（CDN/ブラウザ）は observe box でやらない**（CDN を許可すると `https://<cdn>/<path>` で
-  観測データを exfil できる＝trifecta 復活。P5）。閲覧は AWS cred 非保持側（host か dev box の headless chrome）で行う。
+**Invariants**:
+- AWS cred for write/deploy is **host only**. Observe box is **read-only cred only**. Dev box is **zero AWS cred**.
+- Identity is separated into 3 (P2). Observe box's cred is **short-lived session minted by host and injected at runtime**;
+  no `AssumeRole` inside box (explicitly Deny `sts:AssumeRole` in IAM. Prevent credential broker role. P3).
+- **Don't view apps (CDN/browser) from observe box** (allowing CDN lets exfiltrate observational data via `https://<cdn>/<path>` = trifecta returns. P5). View from credential-less side (host or dev box's headless chrome).
 
-## CLI 既定・MCP 任意
+## CLI Default, MCP Optional
 
-read-only の境界は IAM が作る（P4）ので、CloudWatch MCP 等は**必須でない**。observe box では **`aws` CLI を既定**とする
-（最小・clone で再現できる）。MCP は「作り込み済み観測ツール(anomaly/analyze)が欲しい」「多サービス統一面が要る」時だけの
-任意オプション（MCP tool 面自体が prompt-injection surface を増やすため最小では入れない）。
-具体コマンドは [../examples/observe/runbook.md](../examples/observe/runbook.md)、read-only IAM は
-[../examples/observe/readonly-iam-policy.json](../examples/observe/readonly-iam-policy.json) を参照。
+Read-only boundary is enforced by IAM (P4), so CloudWatch MCP etc. are **not required**. Observe box defaults to **`aws` CLI**
+(minimal, reproducible by clone). MCP is optional only when you want pre-built observational tools (anomaly/analyze) or unified multi-service interface
+(MCP tool surface itself adds prompt-injection surface, so minimal excludes it).
+See [../examples/observe/runbook.md](../examples/observe/runbook.md) for concrete commands, [../examples/observe/readonly-iam-policy.json](../examples/observe/readonly-iam-policy.json) for read-only IAM.
 
-## ユーザーストーリー
+## User Stories
 
-### US1 通常開発（dev box）※本体
-dev box で worktree → 実装 → `/a2a-review` → `gh pr create` → `/pr-codex-ci` → merge-ready。
-AWS cred はこの経路に出てこない。大半の作業はここ。
+### US1 Normal Development (dev box) ※ Main
+In dev box: worktree → implement → `/a2a-review` → `gh pr create` → `/pr-codex-ci` → merge-ready.
+AWS cred doesn't appear in this flow. Most work here.
 
-### US2 host 側で使うケース（privileged / 人手）
-- **deploy**: host で `npm run deploy`（write cred は host のみ）→ 出力 URL を控える（**非 commit**・口頭/非公開メモで提示）。
-  後始末は `cdk destroy`（NAT/ALB/Fargate の課金停止）。
-- **headful 確認**: host Chrome で deploy 済み URL を目視 / box からは cdp-bridge（[headful-bridge.md](../docs/headful-bridge.md)）か、
-  CDN を `sbx policy allow` 後に dev box の headless chrome-devtools MCP で閲覧（dev box は AWS cred 非保持なので trifecta 不成立）。
-- **bridge**: box が host しか見えない事実を `/host-ask` → host が `/host-answer`。
+### US2 Host-side Use Cases (privileged / manual)
+- **deploy**: `npm run deploy` on host (write cred host-only) → note output URL (**don't commit** · share via voice/private note).
+  Cleanup with `cdk destroy` (stop NAT/ALB/Fargate billing).
+- **headful verification**: View deployed URL in host Chrome / from box use cdp-bridge ([headful-bridge.md](../docs/headful-bridge.md)) or
+  after `sbx policy allow` CDN, view via dev box's headless chrome-devtools MCP (dev box holds no AWS cred so trifecta fails).
+- **bridge**: Box only sees host, so `/host-ask` and host answers with `/host-answer`.
 
-### US3 AWS 調査（observe box）※運用保守フェーズの実環境版
-deploy 済み環境で異常（例: 診断が 502）→ observe box を起こし、host が mint した read-only session で
-`aws logs filter-log-events` 等から `external_call{kind:upstream,path:...}` を読む → 構造化ログがそのまま切り分け材料 → 原因特定。
-**read=observe box で自走 / 修正=dev box(write) / 再 deploy=host(privileged)** の read-first・write-gated 3 段（P1）。
-既定は **Review 相当**（人間が修正/再 deploy を承認）。Autonomous な自動修正は扱わない（教材の安全側）。
+### US3 AWS Investigation (observe box) ※ Production operations/maintenance version
+Abnormality in deployed environment (e.g., diagnosis returns 502) → spin up observe box, host-minted read-only session reads
+`external_call{kind:upstream,path:...}` from `aws logs filter-log-events` etc. → structured logs directly become diagnostic material → identify root cause.
+**read=observe box autonomous / fix=dev box(write) / redeploy=host(privileged)** = read-first, write-gated 3-tier (P1).
+Default is **Review-equivalent** (human approves fix/redeploy). Autonomous auto-remediation not covered (safer for teaching materials).
 
-## 公開リポ制約
+## Public Repository Constraints
 
-実 URL / account ID / ARN / log group 実名は **commit しない**（[../README.md](../README.md) / 公開リポ前提）。
-committed なのは placeholder 入りテンプレと runbook だけ。実値は実行時に env/file 注入し、ランタイムメモは
-gitignore 済みの `.claude/tmp/` に置く。
+Don't **commit** real URLs / account IDs / ARNs / log group names ([../README.md](../README.md) / assumes public repo).
+Commit only placeholder-containing templates and runbooks. Real values injected at runtime via env/file, runtime notes placed in
+`.claude/tmp/` (gitignore'd).

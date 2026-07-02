@@ -1,67 +1,67 @@
 ---
 name: box-session-context
-description: "Pulls a Claude Code session transcript from inside an sbx (Docker Sandboxes) box and presents it as reference context on the host. Use when the host needs to inspect a session that ran inside a box — the typical case is HOTL monitoring where the statusLine of a box-internal session shows a session_id and the host wants to read that session's transcript. A thin wrapper over scripts/internal/box-session-context.sh (leaf-layer skill per rules/skills.md); fills the structural gap that the user-scope session-context skill only reads ~/.claude/projects/ on the host. Use when the user mentions box session, box transcript, HOTL transcript, sbx session, 箱の session, box の中の transcript."
+description: "Pulls a Claude Code session transcript from inside an sbx (Docker Sandboxes) box and presents it as reference context on the host. Use when the host needs to inspect a session that ran inside a box — the typical case is HOTL monitoring where the statusLine of a box-internal session shows a session_id and the host wants to read that session's transcript. A thin wrapper over scripts/internal/box-session-context.sh (leaf-layer skill per rules/skills.md); fills the structural gap that the user-scope session-context skill only reads ~/.claude/projects/ on the host. Use when the user mentions box session, box transcript, HOTL transcript, sbx session, box session, session transcript inside box."
 ---
 
 # box-session-context
 
-sbx (Docker Sandboxes) の box 内で動いた Claude Code session の transcript jsonl を host に取り出して context として参照する。本リポは **box-primary 運用** で box 内の session が host の `~/.claude/projects/` に現れず、user-scope `session-context` skill (host 専用) では読めない構造的な穴を埋める。CLAUDE.md `## 開発フロー` の「HOTL 監視 (statusLine の session id → host から transcript)」がまさに本 skill の用途。
+Extracts the Claude Code session transcript jsonl that ran inside an sbx (Docker Sandboxes) box to the host for reference as context. This repository operates **box-primary**, where sessions inside the box do not appear in the host's `~/.claude/projects/`, and the user-scope `session-context` skill (host-only) cannot read them—filling this structural gap. The "HOTL monitoring (statusLine session id → transcript from host)" in CLAUDE.md `## Development Flow` is precisely the use case for this skill.
 
-`scripts/internal/box-session-context.sh` を呼ぶ薄い wrapper (leaf 層、[rules/skills.md](../../../rules/skills.md))。A2A のロジックは持たず、transcript 取り出し + 提示のみに集中する。
+A thin wrapper that calls `scripts/internal/box-session-context.sh` (leaf layer, [rules/skills.md](../../../rules/skills.md)). It has no A2A logic and focuses solely on transcript extraction + presentation.
 
-本 skill は**参照専用**。session の続きを host / 別 box で実行したい (真 resume) なら [`/box-session-resume`](../box-session-resume/SKILL.md) を使う。
+This skill is **read-only**. If you want to continue a session on the host / a different box (true resume), use [`/box-session-resume`](../box-session-resume/SKILL.md).
 
-## 前提条件
+## Prerequisites
 
-- **host で sbx が使える** (本 skill は host 専用、box の中からは使えない。box 内から自身の transcript を見たいなら通常の `session-context` 系で十分)
-- 対象 box が存在し **running** 状態。停止中なら `sbx run --name <box>` で起動してから本 skill を呼ぶ (勝手に起動しない)
-- 対象 box が **built-in claude agent** で起動された箱 (`sbx run claude ...` で立てたもの)。codex 等の他 agent の transcript は対象外
+- **sbx is available on the host** (this skill is host-only and cannot be used from within a box. To see your own transcript from within a box, the standard `session-context` family is sufficient)
+- Target box exists and is in **running** state. If stopped, start it with `sbx run --name <box>` before calling this skill (it will not auto-start)
+- Target box was **started with the built-in claude agent** (`sbx run claude ...`). Transcripts from other agents like codex are out of scope
 
-skill listing は箱の中の Claude にも本 skill を見せるため box 内起動の勘違いが起きうるが、wrapper script が `$SANDBOX_VM_ID` set 時に exit 5 で fail-fast する (引数組み立てに進む前に止まる)。box 内 Claude が exit 5 を受けたら user-scope `/session-context` に切り替えること。
+Since skill listing shows this skill to Claude inside the box as well, there is potential for confusion about box-internal invocation. However, the wrapper script fail-fast exits with exit code 5 when `$SANDBOX_VM_ID` is set (stops before proceeding to argument assembly). If claude inside the box receives exit 5, switch to the user-scope `/session-context`.
 
-## 使い方
+## Usage
 
-引数 = `<session_id> [<box_name>]` (`box_name` は省略可、省略時は auto-detect)。
+Arguments = `<session_id> [<box_name>]` (`box_name` is optional, auto-detected if omitted).
 
-- `session_id`: UUID 形式 (`00000000-0000-0000-0000-000000000000`) または **先頭 8+ hex 短縮形** (`00000000` 等)。短縮形は box 内 transcript で部分一致 1 件確定する場合のみ採用。複数候補なら full UUID を要求する
-- `box_name` (省略可): `sbx ls` の SANDBOX 列の名前 (例: `claude-coding-agent-playbook`)。**省略時は `sbx ls` で `agent==claude && status==running` を満たす box が exactly 1 個確定なら採用**、0 個 (= 起動中の claude box なし) / 複数 (= 並列実行で曖昧) なら明示要求 error で停止 (誤検出回避のため strict に 1 個ヒット要件)
+- `session_id`: UUID format (`00000000-0000-0000-0000-000000000000`) or **leading 8+ hex short form** (`00000000` etc.). Short form is only accepted if it uniquely matches one result in the box's transcript. If multiple matches, request full UUID
+- `box_name` (optional): Name from the SANDBOX column in `sbx ls` (e.g., `claude-coding-agent-playbook`). **If omitted, auto-detect: adopt the box if exactly 1 box matches `agent==claude && status==running` in `sbx ls`**. If 0 matches (no running claude box) or multiple (ambiguous in parallel execution), stop with an error asking for explicit specification (strict 1-hit requirement to avoid false positives)
 
-### 手順
+### Procedure
 
-1. **box 状態確認**: `sbx ls` で対象 box が running か確認。停止中なら `sbx run --name <box_name>` を案内して停止する。box が 1 つしかない場合 (本リポでの典型) は引数省略で auto-detect 動作する
-2. **実行** (host で、cwd は repo root):
+1. **Check box state**: Verify the target box is running with `sbx ls`. If stopped, guide to start with `sbx run --name <box_name>` and stop. If there's only one box (typical for this repo), auto-detect works with omitted arguments
+2. **Execute** (on host, cwd = repo root):
    - Unix / macOS / Git Bash: `bash scripts/internal/box-session-context.sh <session_id> [<box_name>]`
    - Windows PowerShell: `powershell -ExecutionPolicy Bypass -File scripts/internal/box-session-context.ps1 <session_id> [<box_name>]`
-3. script の内部処理:
-   - `sbx exec <box_name> ls /home/agent/.claude/projects/*/<session_id>*.jsonl` で transcript path を検索
-   - 0 件: exit 3 で終了 (案内: `sbx exec <box> ls /home/agent/.claude/projects/` で session 一覧を確認)
-   - 複数件 (短縮形が複数 hit): exit 4 で終了 (full UUID 要求)
-   - 1 件: `sbx cp <box_name>:<path> .claude/tmp/box-session-<short>.jsonl` で host にコピー
-   - stdout に host 側の保存 path を 1 行出力
-4. claude は出力された path を **Read** ツールで読み込み (大きい場合は `offset` / `limit` 使用)、jsonl 各行を JSON parse して以下を抽出して要約する:
-   - session の開始 / 終了時刻 (line の `timestamp` から)
-   - user message / assistant message の主要なやり取り
-   - tool calls (どの tool を何回呼んだか)
-   - 最終状態 (最後の assistant message)
+3. Script internal processing:
+   - Search for transcript path: `sbx exec <box_name> ls /home/agent/.claude/projects/*/<session_id>*.jsonl`
+   - 0 matches: exit 3 (guide: check session list with `sbx exec <box> ls /home/agent/.claude/projects/`)
+   - Multiple matches (short form hits multiple): exit 4 (request full UUID)
+   - 1 match: copy to host with `sbx cp <box_name>:<path> .claude/tmp/box-session-<short>.jsonl`
+   - Output host save path as one line to stdout
+4. Claude reads the output path with the **Read** tool (use `offset` / `limit` for large files), JSON parse each jsonl line, and extract + summarize:
+   - Session start / end time (from line's `timestamp`)
+   - Key user message / assistant message exchanges
+   - Tool calls (which tools were called how many times)
+   - Final state (last assistant message)
 
-### 結果提示
+### Present results
 
-session の概要 (起動時刻 / 主なやり取りの要約 / 最終 assistant message) を user に返す。生 transcript は冗長なので、user が「全部見たい」と言わない限り要約形式にする。
+Return a session overview (start time / summary of key exchanges / final assistant message) to the user. Since raw transcript is verbose, present in summary format unless the user says "I want to see all of it".
 
-## 注意
+## Notes
 
-- transcript は **box 内 filesystem (`/home/agent/.claude/projects/`)** に置かれており、box が `sbx rm` で削除されると失われる。長期保存したい transcript は本 skill で host にコピーしておく
-- copy 先 (`.claude/tmp/box-session-<short>.jsonl`) は git 管理外 (`.claude/tmp/` は `.gitignore` 想定の一時 dir) なので、session 切り替え後も `Read` で参照可能
+- Transcripts are **stored in the box's filesystem (`/home/agent/.claude/projects/`)**. They are lost if the box is deleted with `sbx rm`. If you want to keep transcripts long-term, copy them to the host with this skill
+- The copy destination (`.claude/tmp/box-session-<short>.jsonl`) is outside git management (`.claude/tmp/` is expected in `.gitignore` as a temporary directory), so you can reference it with `Read` even after switching sessions
 
-## トラブルシューティング
+## Troubleshooting
 
-| 問題 | 対処 |
+| Problem | Solution |
 |------|------|
-| `sbx: command not found` | docs/box-ops.md に従って Docker Sandboxes (sbx) を host にインストール |
-| `box <box_name> not found` | `sbx ls` で正確な box 名を確認 |
-| `box <box_name> is not running` | `sbx run --name <box_name>` で起動してから再実行 |
-| `no running claude box found` (auto-detect 失敗) | running な claude agent box が無い。`sbx run claude ... .` で起動するか、`<box_name>` を明示的に指定する |
-| `multiple running claude boxes (...). Specify <box_name> explicitly` (auto-detect 失敗) | 並列で複数 box を立てているケース。`sbx ls` で対象を確認し `<box_name>` を明示的に指定する |
-| `transcript not found for session_id` | `sbx exec <box> ls /home/agent/.claude/projects/` で session 一覧を確認。session_id の typo か別 box の可能性 |
-| `multiple transcripts match short session_id` | 8-hex 短縮形が複数 hit。full UUID を渡すか、`sbx exec <box> ls /home/agent/.claude/projects/*/` で正確な session_id を確認 |
-| copy 後の jsonl が大きすぎて Read で全部読めない | Read の `offset` / `limit` で先頭/末尾を見る、または手順 4 の要約に絞る |
+| `sbx: command not found` | Install Docker Sandboxes (sbx) on the host following docs/box-ops.md |
+| `box <box_name> not found` | Verify the correct box name with `sbx ls` |
+| `box <box_name> is not running` | Start with `sbx run --name <box_name>` and retry |
+| `no running claude box found` (auto-detect failed) | No running claude agent box. Start with `sbx run claude ... .` or explicitly specify `<box_name>` |
+| `multiple running claude boxes (...). Specify <box_name> explicitly` (auto-detect failed) | Multiple boxes running in parallel. Check with `sbx ls` and explicitly specify `<box_name>` |
+| `transcript not found for session_id` | Check session list with `sbx exec <box> ls /home/agent/.claude/projects/`. Possible typo or different box |
+| `multiple transcripts match short session_id` | 8-hex short form matched multiple. Pass full UUID or verify the exact session_id with `sbx exec <box> ls /home/agent/.claude/projects/*/` |
+| jsonl after copy is too large to read with Read | Use Read's `offset` / `limit` to see the beginning/end, or stick to the summary in step 4 |

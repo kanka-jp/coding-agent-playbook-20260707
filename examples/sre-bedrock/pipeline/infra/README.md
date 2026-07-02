@@ -1,50 +1,50 @@
-# infra: パターン A 最小 e2e の CDK（host で deploy）
+# infra: Pattern A minimal e2e CDK (deploy on host)
 
-[pipeline/README.md](../README.md) の build order step 1「A の最小 e2e」を実 AWS に立てる CDK (TypeScript)。
+CDK (TypeScript) deploying [pipeline/README.md](../README.md) build order step 1 "Pattern A minimal e2e" to real AWS.
 
 ```
-S3 に sanitized triage を PUT  ->  EventBridge(Object Created, prefix triage/)  ->  CodeBuild(fixer 識別子)
-   fixer-entrypoint.sh を BACKEND=anthropic | bedrock で実行(triage + 壊れた repo -> claude -p -> PR)
+PUT sanitized triage to S3  ->  EventBridge(Object Created, prefix triage/)  ->  CodeBuild(fixer identity)
+   run fixer-entrypoint.sh with BACKEND=anthropic | bedrock (triage + broken repo -> claude -p -> PR)
 ```
 
-CloudWatch alarm -> 観測 Lambda の自動配線（[triage-lambda/](../triage-lambda/)）はこの上に足す。本 stack は
-**「fixer が実 AWS で動いて PR が出る」を最小コストで確かめる段**。
+Automatic wiring of CloudWatch alarm → observation Lambda ([triage-lambda/](../triage-lambda/)) is added on top. This stack is
+**the phase to verify "fixer runs on real AWS and PR is created"** at minimal cost.
 
-backend は context flag `-c backend=anthropic|bedrock` で切替できる（既定 anthropic）:
-- **anthropic**（既定）: 直 Anthropic API key 経路。Bedrock model access が無い account でも動く。secret に key を投入する
-- **bedrock**: AWS Bedrock 経由（本番経路）。Bedrock の Claude モデル access が account に降りていること。Anthropic key secret は作らず、fixer role に inference profile + foundation model への `bedrock:InvokeModel` を ALLOW する
+Backend is switchable via context flag `-c backend=anthropic|bedrock` (default anthropic):
+- **anthropic** (default): direct Anthropic API key path. Works on accounts without Bedrock model access. Load key into secret
+- **bedrock**: via AWS Bedrock (production path). Account must have Bedrock Claude model access. No Anthropic key secret created; fixer role gets `bedrock:InvokeModel` ALLOW for inference profile + foundation model
 
-## 検証済み / 未検証
+## Verified / Not verified
 
-- **box で検証済み**: `npm ci && npm run build && cdk synth`（CloudFormation 生成・型・construct エラー）。IAM Deny 3 本（`s3:ListBucket` / incident app-data read / `sts:AssumeRole*`）・secret の build phase 取得（`gh auth setup-git` で token を `.git/config` に残さない）・event 由来 key 上書きが template に出ることを確認。
-- **実 AWS が要る（host で）**: 実 deploy・CodeBuild 内の claude/gh 実行・S3 event 配線・実 PR 作成。`cdk deploy` 以降は AWS 資格情報下の host 作業。
+- **Verified in box**: `npm ci && npm run build && cdk synth` (CloudFormation generation, type, construct errors). Confirmed 3 IAM Deny policies (`s3:ListBucket` / incident app-data read / `sts:AssumeRole*`), secret fetched in build phase (`gh auth setup-git` leaves no token in `.git/config`), event-derived key override appears in template.
+- **Real AWS required (on host)**: actual deploy, claude/gh execution inside CodeBuild, S3 event wiring, actual PR creation. From `cdk deploy` onward: host work under AWS credentials.
 
-## 前提（host）
+## Prerequisites (host)
 
-- Node 18+ / AWS CLI / AWS CDK（`npx cdk` でも可）。
-- deploy 用 AWS 資格情報（CloudFormation/S3/CodeBuild/IAM/Events/Secrets を作れる権限）。**dev box には入れない**（persona: deploy は host）。
-- 修正対象 repo に push + PR 作成できる **repo-scoped GitHub token**。
-- backend=anthropic 時: 直 Anthropic API key（`sk-ant-...`）。
-- backend=bedrock 時: Bedrock の対象 Claude モデルに account level の access が降りていること（AWS console → Bedrock → Model access）。
+- Node 18+ / AWS CLI / AWS CDK (`npx cdk` ok too).
+- AWS credentials for deploy (permission to create CloudFormation/S3/CodeBuild/IAM/Events/Secrets). **Do not put in dev box** (persona: deploy on host).
+- **repo-scoped GitHub token** with push + PR creation to target repo.
+- backend=anthropic: direct Anthropic API key (`sk-ant-...`).
+- backend=bedrock: account-level access to target Bedrock Claude model (AWS console → Bedrock → Model access).
 
-## 手順（host）
+## Procedure (host)
 
 ```bash
 cd examples/sre-bedrock/pipeline/infra
 npm ci
-npm run build                      # tsc（cdk.json は bin/app.js を実行する）
+npm run build                      # tsc (cdk.json runs bin/app.js)
 
-# 初回のみ: account/region を bootstrap
+# First time only: bootstrap account/region
 npx cdk bootstrap
 
-# deploy（targetRepo は必須。backend / anthropicModel / targetBranch / prBase は任意）
-# 既定 backend=anthropic（直 key 経路）:
+# deploy (targetRepo required. backend / anthropicModel / targetBranch / prBase optional)
+# Default backend=anthropic (direct key path):
 npx cdk deploy \
   -c targetRepo=<owner>/<repo> \
   -c targetBranch=stage/06-readings-drift-broken \
   -c prBase=stage/06-readings-drift-broken
 
-# backend=bedrock（本番経路）。anthropicModel は inference profile id（既定 global.anthropic.claude-opus-4-6-v1）:
+# backend=bedrock (production path). anthropicModel is inference profile id (default global.anthropic.claude-opus-4-6-v1):
 npx cdk deploy \
   -c backend=bedrock \
   -c targetRepo=<owner>/<repo> \
@@ -52,37 +52,37 @@ npx cdk deploy \
   -c prBase=stage/06-readings-drift-broken
 ```
 
-deploy 後、**Secret に実値を投入**（IaC に焼かないので手で。論理名は出力の Secret ARN から）:
+After deploy, **load actual values into Secrets** (not baked into IaC, manual load; logical names from output Secret ARN):
 
 ```bash
-# backend=anthropic のときは AnthropicApiKey + FixerGithubToken の両方を投入
-aws secretsmanager put-secret-value --secret-id <AnthropicApiKey の ARN> --secret-string 'sk-ant-...'
-aws secretsmanager put-secret-value --secret-id <FixerGithubToken の ARN> --secret-string 'ghp_...'
+# For backend=anthropic, load both AnthropicApiKey + FixerGithubToken
+aws secretsmanager put-secret-value --secret-id <AnthropicApiKey ARN> --secret-string 'sk-ant-...'
+aws secretsmanager put-secret-value --secret-id <FixerGithubToken ARN> --secret-string 'ghp_...'
 
-# backend=bedrock のときは AnthropicApiKey は作られない（IAM で InvokeModel 許可）。GitHub token だけ投入
-aws secretsmanager put-secret-value --secret-id <FixerGithubToken の ARN> --secret-string 'ghp_...'
+# For backend=bedrock, AnthropicApiKey not created (IAM allows InvokeModel). Load GitHub token only
+aws secretsmanager put-secret-value --secret-id <FixerGithubToken ARN> --secret-string 'ghp_...'
 ```
 
-### e2e を起こす
+### Trigger e2e
 
-sanitized triage（[../../spike/triage.json](../../spike/triage.json) と同形）を S3 の `triage/` prefix に置くと、EventBridge が CodeBuild を起動する:
+Place sanitized triage (same form as [../../spike/triage.json](../../spike/triage.json)) under `triage/` prefix in S3, EventBridge starts CodeBuild:
 
 ```bash
-aws s3 cp ../../spike/triage.json "s3://<TriageBucket 名>/triage/$(uuidgen).json"
-# CodeBuild が走り、修正対象 repo に fix PR が出る。ログ: CodeBuild console / CloudWatch Logs
+aws s3 cp ../../spike/triage.json "s3://<TriageBucket name>/triage/$(uuidgen).json"
+# CodeBuild runs, fix PR created in target repo. Logs: CodeBuild console / CloudWatch Logs
 ```
 
-### 片付け
+### Cleanup
 
 ```bash
 npx cdk destroy
 ```
 
-## CodeBuild 内の前提（buildspec が用意）
+## Prerequisites within CodeBuild (buildspec provided)
 
-CodeBuild の standard image に対し buildspec が install phase で `@anthropic-ai/claude-code`（version 固定）と `gh`（無ければ pinned binary）を入れ、**build phase で** `aws secretsmanager get-secret-value` により `GH_TOKEN`（+ backend=anthropic 時は `ANTHROPIC_API_KEY`）を取得（install 中の未固定コードに secret を晒さない）、`gh auth setup-git` で token を `.git/config` に残さず認証して `fixer-entrypoint.sh` を env の `BACKEND`・`ANTHROPIC_MODEL`・`TRIAGE_S3_KEY`(event 由来) で実行する。fixer は **triage 1 件の GET と自分の secret 取得 + backend=bedrock 時は指定 inference profile/foundation model への InvokeModel のみ**（バケット列挙・incident ログ read・他 model 呼出は IAM Deny / 未許可）。
+Against CodeBuild standard image, buildspec loads `@anthropic-ai/claude-code` (pinned version) and `gh` (pinned binary if missing) in install phase, **fetches `GH_TOKEN` (+ `ANTHROPIC_API_KEY` for backend=anthropic) via `aws secretsmanager get-secret-value` in build phase** (no secret exposed to unfixed code during install), authenticates via `gh auth setup-git` leaving no token in `.git/config`, runs `fixer-entrypoint.sh` with env `BACKEND`, `ANTHROPIC_MODEL`, `TRIAGE_S3_KEY` (event-derived). Fixer has **only GET one triage + fetch own secret + (for backend=bedrock) InvokeModel on specified inference profile/foundation model** (bucket enumeration, incident log read, other model calls are IAM Deny / not permitted).
 
-## 本番との差（この stack でやらないこと）
+## Difference from production (not done in this stack)
 
-- CloudWatch alarm -> SNS -> 観測 Lambda の自動 triage 生成（手動 S3 PUT で代用）。
-- 観測/修正の VPC 隔離・PrivateLink（[pipeline/README.md](../README.md)「egress 境界」）。
+- automatic triage generation via CloudWatch alarm → SNS → observation Lambda (replaced by manual S3 PUT).
+- VPC isolation between observation/remediation, PrivateLink ([pipeline/README.md](../README.md) "egress boundary").

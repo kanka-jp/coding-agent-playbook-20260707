@@ -8,35 +8,35 @@ import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 
 export interface FixerPipelineStackProps extends StackProps {
-  /** 修正対象 repo "<owner>/<repo>"。fixer が clone して PR を出す先 */
+  /** Target repo "<owner>/<repo>". fixer clones here and creates PR */
   readonly targetRepo: string;
-  /** 壊れた状態の branch（fix の起点） */
+  /** Broken-state branch (fix starting point) */
   readonly targetBranch: string;
-  /** PR の base branch */
+  /** PR base branch */
   readonly prBase: string;
-  /** anthropic=直 API key、bedrock=AWS Bedrock 経由 */
+  /** anthropic=direct API key, bedrock=via AWS Bedrock */
   readonly backend: "anthropic" | "bedrock";
-  /** backend=anthropic は API model id、bedrock は inference profile id */
+  /** For backend=anthropic, API model id; for bedrock, inference profile id */
   readonly anthropicModel: string;
-  /** fixer-entrypoint.sh を持つ repo（既定 = targetRepo。別 app を直すなら playbook を指す） */
+  /** repo containing fixer-entrypoint.sh (default = targetRepo; point to playbook for fixing different app) */
   readonly entrypointRepo: string;
-  /** fixer-entrypoint.sh の ref（既定 main。default branch 依存にしない） */
+  /** ref of fixer-entrypoint.sh (default main; not tied to default branch) */
   readonly entrypointRef: string;
 }
 
 /**
- * ADR cloud-unattended-sre.md パターン A の「最小 e2e」インフラ:
- *   S3 に sanitized triage を PUT  ->  EventBridge  ->  CodeBuild(fixer 識別子)が
- *   fixer-entrypoint.sh を実行（backend=anthropic で直 key / backend=bedrock で AWS Bedrock）  ->  PR。
- * CloudWatch alarm -> Lambda(観測) の自動配線はこの上に足す（pipeline/README.md）。本 stack は
- * 「fixer が実 AWS で動いて PR が出る」を最小コストで確かめる段。
+ * ADR cloud-unattended-sre.md pattern A "minimal e2e" infrastructure:
+ *   PUT sanitized triage to S3  ->  EventBridge  ->  CodeBuild(fixer identity) runs
+ *   fixer-entrypoint.sh (direct key for backend=anthropic / AWS Bedrock for backend=bedrock)  ->  PR.
+ * Automatic CloudWatch alarm → Lambda(observation) wiring added on top (pipeline/README.md). This stack
+ * is the phase to verify "fixer runs on real AWS and PR is created" at minimal cost.
  */
 export class FixerPipelineStack extends Stack {
   constructor(scope: Construct, id: string, props: FixerPipelineStackProps) {
     super(scope, id, props);
 
-    // sanitized triage の handoff バケット（観測が PUT / fixer が GET する唯一の入力経路）。
-    // EventBridge 通知を有効化して S3 ObjectCreated を rule で受ける。
+    // Sanitized triage handoff bucket (observation PUTs, fixer GETs; sole input path).
+    // Enable EventBridge notification to catch S3 ObjectCreated in rule.
     const triageBucket = new s3.Bucket(this, "TriageBucket", {
       eventBridgeEnabled: true,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -46,15 +46,15 @@ export class FixerPipelineStack extends Stack {
       autoDeleteObjects: true,
     });
 
-    // GitHub token は両 backend 共通で必要。Anthropic key は backend=anthropic のときだけ作る
-    // （bedrock 経路は IAM で InvokeModel を許可するので key 不要）。値は host が put-secret-value で投入する。
+    // GitHub token needed for both backends. Anthropic key created only for backend=anthropic
+    // (bedrock path allows InvokeModel via IAM, key not needed). Host loads values with put-secret-value.
     const githubTokenSecret = new secretsmanager.Secret(this, "FixerGithubToken", {
-      description: "fixer が clone/push/PR に使う repo-scoped GitHub token（host が投入）",
+      description: "repo-scoped GitHub token fixer uses for clone/push/PR (loaded by host)",
     });
     const anthropicKeySecret =
       props.backend === "anthropic"
         ? new secretsmanager.Secret(this, "AnthropicApiKey", {
-            description: "fixer の ANTHROPIC_API_KEY（host が put-secret-value で実値を投入）",
+            description: "fixer's ANTHROPIC_API_KEY (host loads real value with put-secret-value)",
           })
         : undefined;
 
@@ -66,11 +66,11 @@ export class FixerPipelineStack extends Stack {
       PR_BASE: { value: props.prBase },
       ENTRYPOINT_REPO: { value: props.entrypointRepo },
       ENTRYPOINT_REF: { value: props.entrypointRef },
-      // bucket は deploy 時に確定（static）。key だけ EventBridge が build ごとに上書きする。
+      // bucket is static (set at deploy time). key is overridden per-build by EventBridge.
       TRIAGE_BUCKET: { value: triageBucket.bucketName },
       TRIAGE_S3_KEY: { value: "" },
-      // secret 値は env に常時注入せず ARN だけ渡し、install 完了後の build phase で取得する
-      // （install phase の未固定コードに GH_TOKEN を晒さない）。
+      // secret values passed as ARN only, not constantly in env; fetched in build phase after install complete
+      // (don't expose GH_TOKEN to unfixed code during install phase).
       GH_SECRET_ARN: { value: githubTokenSecret.secretArn },
     };
     if (anthropicKeySecret) {
@@ -78,7 +78,7 @@ export class FixerPipelineStack extends Stack {
     }
 
     const buildCommands: string[] = [
-      // secret は install 後の build phase で取得する（install 中の未固定コードに晒さない）。
+      // Fetch secrets in build phase after install (don't expose to unfixed code during install).
       'export GH_TOKEN=$(aws secretsmanager get-secret-value --secret-id "$GH_SECRET_ARN" --query SecretString --output text)',
     ];
     if (anthropicKeySecret) {
@@ -87,22 +87,22 @@ export class FixerPipelineStack extends Stack {
       );
     }
     buildCommands.push(
-      'test -n "$TRIAGE_S3_KEY" || { echo "ERROR: TRIAGE_S3_KEY 未設定(EventBridge override)" >&2; exit 1; }',
+      'test -n "$TRIAGE_S3_KEY" || { echo "ERROR: TRIAGE_S3_KEY not set (EventBridge override)" >&2; exit 1; }',
       'aws s3 cp "s3://$TRIAGE_BUCKET/$TRIAGE_S3_KEY" /tmp/triage.json',
       'git config --global user.email "sre-fixer@users.noreply.github.com"',
       'git config --global user.name "SRE Fixer (unattended)"',
-      // token を clone URL に埋めない: gh の credential helper で push/clone 認証する。これで /work/.git/config
-      // に token が残らず、claude -p の Read が .git/config から token を抜く経路を塞ぐ。
+      // Don't embed token in clone URL: authenticate push/clone via gh credential helper. This prevents token
+      // staying in /work/.git/config, blocking the path for claude -p Read to extract token from .git/config.
       "gh auth setup-git",
-      // entrypoint は明示 ref(既定 main)で取得し default branch 依存にしない。修正対象は壊れた branch を /work に。
+      // Fetch entrypoint with explicit ref (default main) to avoid default-branch dependency. Target repo fetched at broken branch to /work.
       'git clone --depth 1 --branch "$ENTRYPOINT_REF" "https://github.com/$ENTRYPOINT_REPO.git" /tmp/src',
       'git clone "https://github.com/$TARGET_REPO.git" /work',
       'git -C /work checkout "$TARGET_BRANCH"',
-      // BACKEND / ANTHROPIC_MODEL / ANTHROPIC_API_KEY は env 経由で entrypoint に届く（inline 再代入で backend を上書きしない）。
+      // BACKEND / ANTHROPIC_MODEL / ANTHROPIC_API_KEY reach entrypoint via env (inline reassignment doesn't override backend).
       'cd /work && PR_BASE="$PR_BASE" TRIAGE_PATH=/tmp/triage.json bash /tmp/src/examples/sre-bedrock/pipeline/fixer-entrypoint.sh'
     );
 
-    // fixer を回す CodeBuild。source は持たず(NO_SOURCE)、buildspec が clone する。
+    // CodeBuild running fixer. Has no source (NO_SOURCE), buildspec clones it.
     const fixerProject = new codebuild.Project(this, "FixerProject", {
       timeout: Duration.minutes(20),
       environment: {
@@ -115,9 +115,9 @@ export class FixerPipelineStack extends Stack {
         phases: {
           install: {
             commands: [
-              // claude CLI は version 固定（供給網リスク低減。secret はこの phase の env に無い）。
+              // claude CLI pinned version (supply-chain risk mitigation; no secret in this phase env).
               "npm install -g @anthropic-ai/claude-code@2.1.196",
-              // gh が無ければ pinned binary を入れる（CodeBuild standard image は gh 非搭載のことがある）。
+              // Install gh as pinned binary if missing (CodeBuild standard image sometimes lacks gh).
               'type gh >/dev/null 2>&1 || { curl -fsSL https://github.com/cli/cli/releases/download/v2.62.0/gh_2.62.0_linux_amd64.tar.gz | tar xz -C /tmp && install -m755 /tmp/gh_2.62.0_linux_amd64/bin/gh /usr/local/bin/gh; }',
             ],
           },
@@ -128,21 +128,22 @@ export class FixerPipelineStack extends Stack {
       }),
     });
 
-    // ---- fixer 識別子の権限境界（fixer-identity-iam.json の CDK 版）----
-    // 自分の secret（GitHub token、+ backend=anthropic 時は直 key）だけ GET（build phase の get-secret-value 用）。
+    // ---- fixer identity permission boundary (CDK version of fixer-identity-iam.json) ----
+    // GET only own secrets (GitHub token, + direct key for backend=anthropic) (for build phase get-secret-value).
     githubTokenSecret.grantRead(fixerProject);
     if (anthropicKeySecret) {
       anthropicKeySecret.grantRead(fixerProject);
     }
-    // backend=bedrock は直 key の代替として profile + foundation model 両方の InvokeModel を ALLOW。foundation model 側は profile 経由のみに絞る (直接 invoke を塞ぐ defense-in-depth)。
+    // For backend=bedrock, replace direct key with ALLOW InvokeModel on both profile + foundation model.
+    // Restrict foundation model to profile path only (defense-in-depth against direct invoke).
     //   https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-prereq.html
     if (props.backend === "bedrock") {
-      // <region-prefix>.<provider>.<model> から provider 以降 (= foundation model id) を抽出。
-      // region prefix は将来追加されうるため固定列挙せず汎用パターンで剥がす。
+      // Extract provider onwards (= foundation model id) from <region-prefix>.<provider>.<model>.
+      // Don't hard-code region prefix, use generic pattern in case future additions.
       const match = props.anthropicModel.match(/^(?:[a-z][a-z0-9-]*)\.(anthropic\..+)$/);
       if (!match) {
         throw new Error(
-          `backend=bedrock の anthropicModel は inference profile id (例: global.anthropic.claude-opus-4-6-v1) を指定してください: ${props.anthropicModel}`
+          `For backend=bedrock, anthropicModel must be inference profile id (example: global.anthropic.claude-opus-4-6-v1): ${props.anthropicModel}`
         );
       }
       const foundationModelId = match[1];
@@ -167,7 +168,7 @@ export class FixerPipelineStack extends Stack {
         })
       );
     }
-    // triage 1 件を GET（バケット列挙は Deny。event で渡る key だけ読める）。
+    // GET one triage (deny bucket enumeration; read only key passed via event).
     triageBucket.grantRead(fixerProject, "triage/*");
     fixerProject.addToRolePolicy(
       new iam.PolicyStatement({
@@ -176,7 +177,7 @@ export class FixerPipelineStack extends Stack {
         resources: [triageBucket.bucketArn],
       })
     );
-    // incident / app data の read は明示 Deny（観測の仕事。fixer は触らない）。
+    // Explicit Deny on incident/app data read (observation's job; fixer doesn't touch).
     fixerProject.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.DENY,
@@ -193,7 +194,7 @@ export class FixerPipelineStack extends Stack {
         resources: ["*"],
       })
     );
-    // 資格情報ブローカ Deny（権限昇格・観測 role 乗り換えを塞ぐ）。
+    // Credential broker Deny (block privilege escalation, observation role hijack).
     fixerProject.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.DENY,
@@ -209,7 +210,7 @@ export class FixerPipelineStack extends Stack {
     );
 
     // ---- S3 ObjectCreated(triage/*) -> EventBridge -> CodeBuild StartBuild ----
-    // 起動は infra（観測の credential でなく）。fixer に渡る override は event 由来の TRIAGE_S3_KEY だけ。
+    // Startup is infra (not observation credentials). Override reaching fixer is only event-derived TRIAGE_S3_KEY.
     new events.Rule(this, "TriageObjectCreatedRule", {
       eventPattern: {
         source: ["aws.s3"],
@@ -222,7 +223,7 @@ export class FixerPipelineStack extends Stack {
       targets: [
         new targets.CodeBuildProject(fixerProject, {
           event: events.RuleTargetInput.fromObject({
-            // StartBuild の environmentVariablesOverride に event 由来の object key だけ載せる。
+            // Only event-derived object key in StartBuild environmentVariablesOverride.
             environmentVariablesOverride: [
               {
                 name: "TRIAGE_S3_KEY",
@@ -235,20 +236,20 @@ export class FixerPipelineStack extends Stack {
       ],
     });
 
-    // runbook が put-secret-value / s3 cp に使う識別子を deploy 出力で copyable にする。
+    // Make identifiers used by runbook in put-secret-value / s3 cp copyable in deploy output.
     new CfnOutput(this, "TriageBucketName", {
       value: triageBucket.bucketName,
-      description: "triage を置く S3 バケット（s3://<this>/triage/<uuid>.json）",
+      description: "S3 bucket for triage (s3://<this>/triage/<uuid>.json)",
     });
     if (anthropicKeySecret) {
       new CfnOutput(this, "AnthropicApiKeySecretArn", {
         value: anthropicKeySecret.secretArn,
-        description: "put-secret-value で ANTHROPIC_API_KEY を投入する Secret ARN",
+        description: "Secret ARN for loading ANTHROPIC_API_KEY with put-secret-value",
       });
     }
     new CfnOutput(this, "FixerGithubTokenSecretArn", {
       value: githubTokenSecret.secretArn,
-      description: "put-secret-value で GitHub token を投入する Secret ARN",
+      description: "Secret ARN for loading GitHub token with put-secret-value",
     });
   }
 }

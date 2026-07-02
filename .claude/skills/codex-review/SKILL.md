@@ -1,91 +1,91 @@
 ---
 name: codex-review
-description: "Asks codex (OpenAI) for a fast second opinion on a file path, diff, or code instruction, and returns its findings as an issue list or LGTM. In a box session (SANDBOX_VM_ID set) automatically delegates to /a2a-review (A2A codex pair) — the caller does not need to detect the environment. In a host session calls the host codex CLI directly. Use when the user asks for a codex review or second opinion, mentions codex review / 別の目で見て / codex にレビューさせて, or when /pr-ci needs the codex step. A thin wrapper over `codex exec --skip-git-repo-check` on host, or /a2a-review on box (leaf-layer skill per rules/skills.md, not an orchestrator)."
+description: "Asks codex (OpenAI) for a fast second opinion on a file path, diff, or code instruction, and returns its findings as an issue list or LGTM. In a box session (SANDBOX_VM_ID set) automatically delegates to /a2a-review (A2A codex pair) — the caller does not need to detect the environment. In a host session calls the host codex CLI directly. Use when the user asks for a codex review or second opinion, mentions codex review / look at with fresh eyes / have codex review it, or when /pr-ci needs the codex step. A thin wrapper over `codex exec --skip-git-repo-check` on host, or /a2a-review on box (leaf-layer skill per rules/skills.md, not an orchestrator)."
 ---
 
 # codex-review
 
-host にインストールされた **codex (OpenAI) CLI を直接呼んで** PR diff / ファイル / コード片への第二意見を取る leaf skill ([rules/skills.md](../../../rules/skills.md))。`/a2a-review` の host 対称 — 役割 (codex 1 体の速い second opinion) と契約 (correctness / security / regression のみ採用 / nice-to-have skip) は同一で、**transport だけ違う** (A2A pair なし、host codex CLI を直接 exec)。
+Leaf skill ([rules/skills.md](../../../rules/skills.md)) that **directly invokes the codex (OpenAI) CLI installed on host** to get a second opinion on PR diff / file / code snippet. Host counterpart to `/a2a-review` — the role (fast second opinion from 1 codex) and contract (adopt only correctness / security / regression / skip nice-to-have) are identical, **only transport differs** (no A2A pair, directly exec host codex CLI).
 
-box-native の `/pr-codex-ci` フローに対し、host から PR を作って後処理する場合の codex 入口として `/pr-ci` から compose される。host claude が能動的に呼ぶ second opinion で、PR に post された他者 review への対応は別 skill `/pr-review-respond` (混同しない)。
+For box-native `/pr-codex-ci` flow vs. creating and post-processing PR from host, composed from `/pr-ci` as the codex entry point. A proactively invoked second opinion from host claude; handling of other reviews already posted on PR is separate skill `/pr-review-respond` (don't confuse).
 
-## 前提
+## Prerequisites
 
-- **box session では自動的に `/a2a-review` に委譲** (step 1 参照)。呼び出し元は環境を意識せず本 skill を invoke してよい
-- **host session では host `codex` CLI を直接呼ぶ**想定
-- **`codex` CLI が host にインストール済み**: `which codex` で path が返ること。未インストールの場合は HOTL escalate (下記)
-- **`codex login` 済み**: OpenAI subscription を OAuth login で認証してあること。未認証の場合は CLI が auth error で fail する
-- **外部 AI にデータを送信する skill**: 起動時に明示的に警告する。実行前に「⚠️ 外部 AI (OpenAI Codex) にコード / diff を送信します」を表示する
+- **In box session, automatically delegates to `/a2a-review`** (see step 1). The caller can invoke this skill without being aware of the environment
+- **In host session, directly invoke host `codex` CLI**
+- **`codex` CLI is pre-installed on host**: `which codex` should return a path. If not installed, HOTL escalate (below)
+- **`codex login` is done**: OpenAI subscription authenticated via OAuth login. If not authenticated, CLI fails with auth error
+- **Skill that sends data to external AI**: Explicitly warn at startup. Display "⚠️ Sending code / diff to external AI (OpenAI Codex)" before execution
 
-## 使い方
+## Usage
 
-引数 = レビュー対象。repo-root 相対のファイルパス / `diff` / 自由な指示文 (日本語可)。引数が空なら何をレビューするか先に聞く。
+Arguments = review target. Repo-root relative file path / `diff` / free-form instruction (Japanese OK). If empty, ask what to review first.
 
-### 手順
+### Procedure
 
-1. **環境チェック**:
-   - **box 環境 → `/a2a-review` に委譲して終了**: `printenv SANDBOX_VM_ID || true` を確認し、値があれば **`⚠️ 外部 AI (OpenAI Codex) にコード / diff を送信します` を 1 行表示してから `/a2a-review <引数>` を invoke してその結果をそのまま返す** (box の `codex` CLI は sbx/Dockerfile で install されているが auth context が host とは別で、host `codex login` 状態が box には伝わらないため host CLI を使わない。`/a2a-review` が box-native の同等 skill):
-     > 「⚠️ 外部 AI (OpenAI Codex) にコード / diff を送信します」
-     > 「box 内で動作中のため `/a2a-review` に委譲します。」
-   - `which codex` で host に codex CLI があるか確認
-   - 無ければ本 skill を停止し HOTL escalate:
-     > 「host に `codex` CLI が見つかりません。`npm i -g @openai/codex` でインストールし `codex login` で OpenAI subscription を認証してから、`/codex-review` を再度叩いてください。あるいは box session に切り替えて `/a2a-review` (box-native の同等 skill) を使ってください (`bash scripts/dev.sh <NAME>` で起動)。」
+1. **Environment check**:
+   - **Box environment → delegate to `/a2a-review` and exit**: Check `printenv SANDBOX_VM_ID || true`; if it has a value, **display "⚠️ Sending code / diff to external AI (OpenAI Codex)" in 1 line then invoke `/a2a-review <argument>` and return its result as-is** (box's `codex` CLI is installed in sbx/Dockerfile but has separate auth context from host; host's `codex login` state doesn't reach box, so don't use host CLI. `/a2a-review` is the box-native equivalent skill):
+     > "⚠️ Sending code / diff to external AI (OpenAI Codex)"
+     > "Running in box, delegating to `/a2a-review`."
+   - Check if host has codex CLI with `which codex`
+   - If not, stop this skill and HOTL escalate:
+     > "host codex CLI not found. Install with `npm i -g @openai/codex`, authenticate OpenAI subscription with `codex login`, then re-invoke `/codex-review`. Or switch to box session and use `/a2a-review` (box-native equivalent skill) (start with `bash scripts/dev.sh <NAME>`)."
 
-2. **データ送信警告**: 「⚠️ 外部 AI (OpenAI Codex) にコード / diff を送信します」を 1 行表示する。
+2. **Data transmission warning**: Display "⚠️ Sending code / diff to external AI (OpenAI Codex)" in 1 line.
 
-3. **指示文の組み立て** (下記「指示文の組み立て」参照)
+3. **Assemble instruction** (see "Instruction assembly" below)
 
-4. **実行**: stdin redirect 経由で長文プロンプトを渡す。**一時ファイルは fresh clone で `.claude/tmp/` が存在しない可能性があるため `mkdir -p` を先に行い、また並列 invoke 衝突を避けるため一意名 (session id 短縮形 / PID 等の suffix) を付ける**:
+4. **Execute**: Pass long-form prompt via stdin redirect. **Temp file may not exist in `.claude/tmp/` in fresh clone, so run `mkdir -p` first; also add unique name (session id short form / PID suffix etc) to avoid parallel invoke collisions**:
    ```bash
    mkdir -p .claude/tmp
-   # PROMPT_FILE=.claude/tmp/codex-review-prompt-<unique-suffix>.md として Write
-   # codex exec の PROMPT positional は `-` (stdin) を明示 (公式 CLI ref: `string | -` 形式)
+   # Write as PROMPT_FILE=.claude/tmp/codex-review-prompt-<unique-suffix>.md
+   # codex exec PROMPT positional explicitly uses `-` (stdin) (official CLI ref: `string | -` form)
    codex exec --skip-git-repo-check -s read-only - < "$PROMPT_FILE"
    ```
-   reasoning effort を上げたい場合 (任務が複雑な PR diff 等) は `-c 'model_reasoning_effort="high"'` を付与 (`-s read-only` と `-` は必ず保持):
+   If you want to raise reasoning effort (for complex PR diff tasks etc), add `-c 'model_reasoning_effort="high"'` (keep `-s read-only` and `-`):
    ```bash
    codex -c 'model_reasoning_effort="high"' exec --skip-git-repo-check -s read-only - < "$PROMPT_FILE"
    ```
-   `-s read-only` は **必須**: PR review は本質的に read-only な役割で、codex に workspace 書き込み権限を持たせない (review 中に codex が誤って host のファイルを編集・実行する経路を構造的に塞ぐ。`/a2a-review` 側も同じ sandbox 制約を持つ)。`-` (positional PROMPT placeholder) は codex CLI が stdin から prompt を読むことを明示する公式 ref 準拠形 (省略しても現状動くが contract 整合のため必須)。`--cd` は不要 (current cwd を codex が読む)。一時 prompt ファイルは実行後に削除する。
+   `-s read-only` is **mandatory**: PR review is inherently a read-only role; don't give codex workspace write permission (structurally block the path where codex might accidentally edit/execute host files during review. `/a2a-review` side has the same sandbox constraint). `-` (positional PROMPT placeholder) is the official-ref-compliant form to explicitly show codex CLI reads prompt from stdin (works without it currently, but required for contract alignment). `--cd` not needed (codex reads current cwd). Delete temp prompt file after execution.
 
-5. **CLI が auth / network error で fail** した場合は本 skill を停止し HOTL escalate (黙って止まらない / 選択肢を出さない):
-   > 「codex CLI が `<エラー要旨>` で fail しました。recovery 候補:
-   > - auth エラーなら `codex login` で再認証
-   > - network エラーなら接続確認後に `/codex-review` を再度叩く
-   > - 切り替え案: box session で `/a2a-review` を使う (`bash scripts/dev.sh <NAME>` で起動)」
+5. **If CLI fails with auth / network error**, stop this skill and HOTL escalate (don't silently stop / don't offer choices):
+   > "codex CLI failed with `<error summary>`. Recovery options:
+   > - If auth error, re-authenticate with `codex login`
+   > - If network error, verify connection then re-invoke `/codex-review`
+   > - Switch option: use `/a2a-review` in box session (start with `bash scripts/dev.sh <NAME>`)"
 
-6. 下記「結果提示」
+6. See "Result presentation" below
 
-**指示文の組み立て**: 引数を 1 つの review 指示文にする。codex は cwd の repo を自分で読むので、**パス/diff を指示で渡す**:
+**Instruction assembly**: Turn argument into 1 review instruction. codex reads the repo in cwd by itself, so **pass path/diff in the instruction**:
 
-- ファイル: `tools/a2a-review/codex-a2a-server/server.py を correctness / edge-case 観点でレビューして`
-- diff: `git diff origin/main...HEAD を correctness / security / regression 観点でレビュー`
-- worktree: `git -C .worktrees/<NN>/ diff HEAD をレビューして` のように `-C` でツリーを明示
+- File: `review tools/a2a-review/codex-a2a-server/server.py from correctness / edge-case perspective`
+- Diff: `review git diff origin/main...HEAD from correctness / security / regression perspective`
+- Worktree: `review git -C .worktrees/<NN>/ diff HEAD` — explicitly specify tree with `-C`
 
-PR diff review 用の標準プロンプト (`/pr-ci` から呼ばれる時はこれを使う):
+Standard prompt for PR diff review (use this when called from `/pr-ci`):
 
 ```text
-以下の PR diff を correctness / security / regression / 既存契約違反の観点でレビューしてください。
+Please review the following PR diff from the perspective of correctness / security / regression / existing contract violations.
 
-base: <base-ref> (例: origin/main)
-diff: `git diff <base-ref>...HEAD` の出力
+base: <base-ref> (example: origin/main)
+diff: output of `git diff <base-ref>...HEAD`
 
-採否方針:
-- 採用すべき: 明確な correctness bug / security 脆弱性 / regression / 既存契約 (型・テスト・仕様) 違反
-- 採用しない: nice-to-have の改善提案 / 将来拡張 / refactor 推奨 / コメント追加推奨 (addition bias 回避)
+Adoption policy:
+- Should adopt: clear correctness bug / security vulnerability / regression / existing contract (type / test / spec) violation
+- Should not adopt: nice-to-have improvement suggestions / future extensions / refactor recommendations / comment addition recommendations (avoid addition bias)
 
-LGTM の場合はその旨を 1 行で返す。指摘がある場合は file:line + severity (correctness / security / regression / contract) + 修正案を箇条書きで返す。
+If LGTM, return that in 1 line. If there are findings, return as bulleted list: file:line + severity (correctness / security / regression / contract) + fix suggestion.
 ```
 
-**結果提示**: codex の最終 artifact (指摘 or LGTM) を要約してユーザーに返す。codex の指摘は **second opinion** であり、採否は claude / ユーザーが判断する (AI 1 体の指摘を独立根拠にしない)。`## Codex (OpenAI)` 見出しで結果を表示する。
+**Result presentation**: Summarize codex's final artifact (findings or LGTM) and return to user. codex's findings are **second opinion**; adoption decision is made by claude / user (don't use 1 AI's findings as independent basis). Display results under `## Codex (OpenAI)` heading.
 
-## トラブルシューティング
+## Troubleshooting
 
-| 問題 | 対処 |
+| Issue | Resolution |
 |------|------|
-| `which codex` が空 | `npm i -g @openai/codex` でインストール後、`codex login` で認証 |
-| `codex login` 未実施 / 期限切れ | host で `codex login` を実行 |
-| network error (proxy 配下等) | host 側 network 設定確認。socks/http proxy 経由なら `HTTPS_PROXY` env が codex に伝わるか確認 |
-| 指摘が広範すぎる (nice-to-have が大量) | 指示文に「nice-to-have skip」「correctness / security / regression のみ」を明示 (上記標準プロンプト参照)。reasoning effort を `--xhigh` に上げると逆に detailed すぎることもあるので、PR review 用途は `high` 程度で十分 |
-| box 内で本 skill を invoke した | step 1 が自動検出して `/a2a-review` に委譲するため特段の対処不要。委譲後に reviewer 未到達 error が出たら `/a2a-review` のトラブルシューティングに従う |
-| 結果に tool-use ナレーション (思考過程) が混ざる | codex は stream 出力に reasoning trace を含むことがある。表示時に最終 artifact だけ抽出する |
+| `which codex` is empty | Install with `npm i -g @openai/codex`, then authenticate with `codex login` |
+| `codex login` not done / expired | Run `codex login` on host |
+| Network error (behind proxy etc) | Check host network settings. If going through socks/http proxy, verify `HTTPS_PROXY` env reaches codex |
+| Findings too broad (lots of nice-to-have) | Explicitly state in instruction "skip nice-to-have", "correctness / security / regression only" (see standard prompt above). Raising reasoning effort to `--xhigh` can make output overly detailed; `high` is sufficient for PR review use |
+| Invoked this skill inside box | step 1 auto-detects and delegates to `/a2a-review`, no special action needed. If reviewer unreachable error appears after delegation, follow `/a2a-review` troubleshooting |
+| Result mixed with tool-use narration (thought process) | codex may include reasoning trace in stream output. Extract only final artifact when displaying |

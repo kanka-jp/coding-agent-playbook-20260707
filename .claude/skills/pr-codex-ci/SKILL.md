@@ -1,83 +1,83 @@
 ---
 name: pr-codex-ci
-description: "Runs the post-PR pipeline: gets a codex (OpenAI) second-opinion review of the PR diff by composing the /a2a-review skill, applies a CI gate, and loops fixing codex findings and CI failures until the PR is review-clean and CI is green (or no CI configured). The box-native, codex-only post-PR follow-up (the in-box counterpart to host-side multi-AI review). Use after creating a PR, when the user asks to review a PR with codex and watch CI, or mentions PR review + CI / codex に PR を見せて / PR の後処理. Orchestrates /a2a-review + gh pr checks; the per-box codex reviewer (cdx-<NAME>) must already be running (auto-provisioned by dev.sh)."
+description: "Runs the post-PR pipeline: gets a codex (OpenAI) second-opinion review of the PR diff by composing the /a2a-review skill, applies a CI gate, and loops fixing codex findings and CI failures until the PR is review-clean and CI is green (or no CI configured). The box-native, codex-only post-PR follow-up (the in-box counterpart to host-side multi-AI review). Use after creating a PR, when the user asks to review a PR with codex and watch CI, or mentions PR review + CI / show PR to codex / post-PR handling. Orchestrates /a2a-review + gh pr checks; the per-box codex reviewer (cdx-<NAME>) must already be running (auto-provisioned by dev.sh)."
 ---
 
 # pr-codex-ci
 
-PR 作成後の **codex review + CI gate** を回す box-native の後処理フロー。**codex 呼び出しは `/a2a-review` skill に委譲**（A2A の入口を 1 本に集約し、reviewer 到達性は `/a2a-review` 側に任せる）し、本 skill は **CI gate + 修正ループの orchestration に徹する**。box には他の AI CLI が無いため codex 1 体での second opinion。
+Box-native post-PR pipeline of **codex review + CI gate**. **Delegates codex invocation to `/a2a-review` skill** (consolidates A2A entry to single point, leaves reviewer reachability to `/a2a-review` side) and this skill **focuses on CI gate + fix loop orchestration**. Box has no other AI CLI, so second opinion from 1 codex.
 
-## Autonomy（中間確認なしで発火・進行）
+## Autonomy (trigger and proceed without intermediate confirmation)
 
-本 skill は **`gh pr create` 直後に確認を求めず invoke される**（[../../../rules/pr-followup.md](../../../rules/pr-followup.md) 「いつ発火するか」参照）。skill 起動後も「このまま続けますか？」「codex 指摘を採用しますか？」「再 push しますか？」等の**選択肢提示で停止しない**。採否は本 skill の判定基準（correctness / security / regression / 既存契約違反のみ採用）で自走決定する。
+This skill **is invoked immediately after `gh pr create` without requesting confirmation** (see [../../../rules/pr-followup.md](../../../rules/pr-followup.md) "When to trigger"). After skill startup, **don't stop at offering choices** like "continue?", "adopt codex findings?", "re-push?". Adoption decision is auto-determined by this skill's judgment criteria (adopt only correctness / security / regression / existing contract violations).
 
-明示的に停止するのは以下のみ:
-- **最終 merge-ready 報告**（local gate: codex 採用指摘ゼロ + CI green or 未設定 / remote gate: 全 thread resolved + 新規 review settle が AND で揃った状態）— user に状況を返して停止。merge 実行はユーザー判断（`gh pr merge` は明示指示時のみ）。**local gate clean だけで停止しない**（後続 step 5 で remote gate を確認する）
-- **HOTL escalate**（自走不能事象）— reviewer 未到達 / CI 失敗が修正不能 / conflict 自動解決不能 / `/pr-review-respond` の採否判断不能・修正不能 等（`/pr-review-respond` 実行中の check terminal 化 hang は、caller が leaf 戻り待ちで blocked のため本 step 3 でなく `/pr-review-respond` の leaf-side 30 分 bound で escalate される）。**選択肢ではなく、何が起きたか + 必要な人間操作 + 再開コマンドを 1〜2 行で明示**して停止（メッセージ形は [../../../rules/pr-followup.md](../../../rules/pr-followup.md) 「自走不能時の HOTL escalate」参照）。「無言で詰む」「次どうしますか？を出す」は禁止
+Stop explicitly only for:
+- **Final merge-ready report** (local gate: zero codex findings to adopt + CI green or unset / remote gate: all threads resolved + new review settled both AND) — return status to user and stop. Merge execution is user judgment (`gh pr merge` only on explicit instruction). **Don't stop at just local gate clean** (step 5 checks remote gate after).
+- **HOTL escalate** (unsolvable situation) — reviewer unreachable / CI failure unfixable / conflict auto-resolve impossible / `/pr-review-respond` adjudication/fix impossible etc (check terminal hang during `/pr-review-respond` execution is escalated in `/pr-review-respond` leaf-side 30-min bound, not here in step 3, since caller is blocked waiting for leaf return). **Clearly state what happened + necessary human action + restart command in 1-2 lines** (message form: see [../../../rules/pr-followup.md](../../../rules/pr-followup.md) "HOTL escalate when unsolvable"). Prohibit "silently stuck" or "what's next?"
 
-### 本 skill 起動前に reviewer health を手動 probe しない
+### Do not manually probe reviewer health before invoking this skill
 
-reviewer 健康確認は **本 skill の step 1a (lease 確認) + step 2 (実 invoke 時の到達性確認) に一元化** されている。本 skill を invoke する**前**に agent が `ps aux | grep cdx` / `pgrep` 等で自 box 内のプロセスを覗いて「reviewer down」と判定するのは**規範違反**（[../../../rules/pr-followup.md](../../../rules/pr-followup.md) 「禁止する自己判断」参照）。cdx-`<NAME>` reviewer は**別 sbx microVM** で動くため自 box の PID namespace には**原理的に出ず**、`ps aux` は reviewer health の proxy として**そもそも成立しない**。`gh pr create` 直後に確認なしで本 skill を起動し、step 1a の lease 確認に reviewer 健康判定を委ねること。
+Reviewer health confirmation is **centralized in this skill's step 1a (lease check) + step 2 (reachability confirmation at actual invocation)**. It's a **norm violation** for the agent to probe processes inside its own box via `ps aux | grep cdx` / `pgrep`, etc. before invoking this skill and judge "reviewer down" (see [../../../rules/pr-followup.md](../../../rules/pr-followup.md) "Prohibited self-judgment"). The cdx-`<NAME>` reviewer runs in a **different sbx microVM**, so it **fundamentally does not appear** in the current box's PID namespace; `ps aux` is not even a valid proxy for reviewer health in principle. Launch this skill immediately after `gh pr create` without confirmation, and delegate reviewer health judgment to step 1a's lease check.
 
-## 前提
+## Prerequisites
 
-- 本 skill は **dev box (`bash scripts/dev.sh` 起動の bind-mount box) の中**で動く想定。dev.sh が起動時に cdx-`$SANDBOX_VM_ID` reviewer box を auto-provision + pair-serve を bg fork し、advertise URL を box の env (`$A2A_CODEX_URL`) に注入する (per-pair lifecycle)。`/a2a-review` は env を見て codex に到達する
-- `/a2a-review` が reviewer 未到達 error を返したら本 skill は HOTL escalate で停止 (`/a2a-review` の HOTL メッセージをそのまま受け流す)
-- `gh` が使える（box では proxy 認証）。CI は GitHub Actions（`gh pr checks`）を想定
-- sandbox box (`bash scripts/dev.sh sandbox` 起動) では reviewer pair が存在しないため本 skill は使えない。`bash scripts/dev.sh attach` で既存 dev box に attach し直すか、`bash scripts/dev.sh` で新規 dev box を起動すること
+- This skill assumed to run **inside dev box (`bash scripts/dev.sh` launch bind-mount box)**. dev.sh at startup auto-provisions cdx-`$SANDBOX_VM_ID` reviewer box + bg-forks pair-serve, injects advertise URL into box env (`$A2A_CODEX_URL`) (per-pair lifecycle). `/a2a-review` sees env to reach codex
+- If `/a2a-review` returns reviewer-unreachable error, this skill HOTL escalates and stops (pass through `/a2a-review`'s HOTL message as-is)
+- `gh` available (box uses proxy auth). CI assumes GitHub Actions (`gh pr checks`)
+- Sandbox box (`bash scripts/dev.sh sandbox` launch) has no reviewer pair, so this skill can't be used. Re-attach to existing dev box with `bash scripts/dev.sh attach` or launch new dev box with `bash scripts/dev.sh`
 
-## 引数
-PR 番号。省略時は現在の branch の PR を `gh pr view --json number` で解決する。
+## Arguments
+PR number. If omitted, resolve current branch's PR with `gh pr view --json number`.
 
-## 手順（merge-ready まで loop）
+## Steps (loop until merge-ready)
 
-1. **PR 解決**: 引数、無ければ `gh pr view --json number,baseRefName,headRefName` で PR 番号と base branch を得る。
+1. **Resolve PR**: Use arguments; if omitted, get PR number and base branch with `gh pr view --json number,baseRefName,headRefName`.
 
-1a. **reviewer preflight (chain 末尾でなく PR 直後に reviewer 不在を検出)**: per-NAME pair の lease (`.claude/tmp/cdx-serve-$SANDBOX_VM_ID.lease`) を確認する。**lease のパス解決は writer (`scripts/internal/a2a-review.sh` の pair-serve) と一致させる** — writer は `git rev-parse --path-format=absolute --git-common-dir` の親 (= main checkout root) に `cd` してから `.claude/tmp/cdx-serve-<NAME>.lease` を書くため、reader 側も `--show-toplevel` (worktree session で worktree root を返す) でなく **`--git-common-dir` の親**で解決する。**preflight は cheap な早期検出に徹し TCP probe は走らせない** (TCP readiness は次 step の `/a2a-review` 実 invoke 側で発覚させる役割分担)。
-   **escalate を出す前に、box 内で `echo $SANDBOX_VM_ID` の値を取得し、メッセージ内の `<box-name>` placeholder を実 box 名 (リテラル) で置換すること** (host shell には `$SANDBOX_VM_ID` env が無いため、literal を貼らないと空展開で別 session に化ける)。
-   - lease 不在 → HOTL escalate: 「per-NAME pair の lease (`.claude/tmp/cdx-serve-<box-name>.lease`) が見つかりません。host で `bash scripts/dev.sh <box-name>` を再起動してください (dev.sh が現 box 名で idempotent attach-or-create + pair-serve を bg fork します)。完了後、`/pr-codex-ci <PR番号>` を再度叩いてください。」
-   - lease 存在 + `lease.claude_box != $SANDBOX_VM_ID` → HOTL escalate: 「lease は `<lease.claude_box>` 用で、現 box `<box-name>` と一致しません (古い lease が残存)。host で `bash scripts/dev.sh <box-name>` を再起動してください。」
+1a. **Reviewer preflight (detect reviewer absence right after PR creation, not at chain end)**: Check the per-NAME pair's lease (`.claude/tmp/cdx-serve-$SANDBOX_VM_ID.lease`). **Resolve lease path to match the writer (`scripts/internal/a2a-review.sh` pair-serve)** — the writer `cd`'s to the parent of `git rev-parse --path-format=absolute --git-common-dir` (= main checkout root), then writes `.claude/tmp/cdx-serve-<NAME>.lease`. The reader side must also resolve to **the parent of `--git-common-dir`**, not `--show-toplevel` (which returns worktree root in worktree sessions). **Preflight is cheap early detection; don't run TCP probes** (TCP readiness discovery is the responsibility of the next step's `/a2a-review` actual invocation).
+   **Before outputting escalate, get the value of `echo $SANDBOX_VM_ID` inside the box and replace the `<box-name>` placeholder in the message with the actual box name (literal)** (host shell has no `$SANDBOX_VM_ID` env; without the literal, empty expansion becomes a different session).
+   - Lease missing → HOTL escalate: "per-NAME pair lease (`.claude/tmp/cdx-serve-<box-name>.lease`) not found. Restart `bash scripts/dev.sh <box-name>` on host (dev.sh idempotently attach-or-create the current box name + bg-fork pair-serve). Then re-run `/pr-codex-ci <PR-number>`."
+   - Lease exists + `lease.claude_box != $SANDBOX_VM_ID` → HOTL escalate: "Lease is for `<lease.claude_box>`; doesn't match current box `<box-name>` (stale lease remains). Restart `bash scripts/dev.sh <box-name>` on host."
 
-2. **codex review（`/a2a-review` に委譲）**: PR の diff を対象に `/a2a-review` を invoke する:
+2. **Codex review (delegate to `/a2a-review`)**: Invoke `/a2a-review` targeting the PR's diff:
    ```text
-   /a2a-review origin/<base>...HEAD の diff を correctness / security / regression 観点でレビュー
+   /a2a-review review origin/<base>...HEAD diff for correctness / security / regression aspects
    ```
-   `/a2a-review` が `bash scripts/internal/a2a-review.sh ask` で codex に投げ (URL は `$A2A_CODEX_URL` から派生)、結果を返す。**codex の指摘は second opinion** であり採否は自分で判断する (AI 1 体の指摘を独立根拠にしない。nice-to-have / 将来用の拡張提案は採用せず、明確な correctness / security / regression / 既存契約違反のみ修正対象)。
+   `/a2a-review` sends to codex via `bash scripts/internal/a2a-review.sh ask` (URL derived from `$A2A_CODEX_URL`) and returns findings. **Codex findings are a second opinion**; you judge adoption (don't treat 1 AI's opinion as independent evidence. Don't adopt nice-to-have / future-looking extensions; only fix clear correctness / security / regression / existing contract violations).
 
-   **`/a2a-review` が reviewer 未到達 error を返した場合**は本 skill を停止し HOTL escalate メッセージを 1〜2 行で明示する (黙って止まらない):
-   > 「`/a2a-review` が cdx-`<box-name>` reviewer に到達できません。recovery は active lock が dev.sh 再起動を block するため**順序が重要**:
-   > 1. box の terminal で **Ctrl-D / `exit`** で claude を抜け dev.sh を正常終了 (trap が cdx-pair + lock を cleanup)
-   > 2. host で `bash scripts/dev.sh <box-name>` を再起動 (新 lock + pair-serve 再 fork)
-   > 3. 起動後 `/pr-codex-ci <PR番号>` を再度叩いてください
+   **If `/a2a-review` returns a reviewer-unreachable error**, stop this skill and output HOTL escalate message in 1-2 lines (don't silently stop):
+   > "`/a2a-review` cannot reach cdx-`<box-name>` reviewer. Recovery order is critical because active lock blocks dev.sh restart:
+   > 1. **Ctrl-D / `exit`** claude from box terminal and exit dev.sh cleanly (trap cleans up cdx-pair + lock)
+   > 2. Restart `bash scripts/dev.sh <box-name>` on host (new lock + pair-serve re-fork)
+   > 3. After startup, re-run `/pr-codex-ci <PR-number>`
    >
-   > hang して exit 不能なら host で `sbx rm -f <box-name>` → step 2 (state 失われます)。`<box-name>` は box 内 `echo $SANDBOX_VM_ID` の literal で置換。」
+   > If hanging and can't exit, run `sbx rm -f <box-name>` on host → step 2 (state lost). Replace `<box-name>` with the literal output of `echo $SANDBOX_VM_ID` inside the box."
 
-3. **CI gate**: `gh pr checks <PR番号>` で状態を見る。
-   - 進行中（pending / in_progress）→ 間隔を置いて再確認。push 直後は前 commit の stale な結果を掴みうるため、新しい run が始まってから判定する。**長時間 進捗なしの bound**: 同じ check が **30 分以上 status 変化なし**（`pending` のまま / `in_progress` のまま）なら manual approval 待ち / queue hang / runner shortage / 実行 hang を疑い HOTL escalate（無限ループ回避）。`pending` だけでなく **`in_progress` でも step ログが進まない hang** を同じ bound でカバーする。形: 「CI run `<id>` が `<経過分>` `<pending or in_progress>` のまま進捗しません。manual approval / queue hang / runner shortage / 実行 hang の可能性。`gh run view <id> --web` で手動確認してください。原因解消後、`/pr-codex-ci <PR番号>` を再度叩いてください。」
-   - 失敗 → 失敗した check の原因を特定（run-id は失敗 check の URL か `gh run list --commit <SHA> --json databaseId` で取得し、`gh run view <run-id> --log-failed` で失敗 log を見る。引数なしの `gh run view` は対話 TUI で hang するため使わない）。
-   - checks 0 件 → push 直後は CI 未登録で一過性に 0 件になりうるため、少し待っても 0 件のままなら CI 未設定とみなして skip（一過性の 0 件を「CI 無し」と誤判定して merge-ready にしない）。
+3. **CI gate**: Check status with `gh pr checks <PR-number>`.
+   - In progress (pending / in_progress) → recheck after an interval. Right after push, stale results from the previous commit may be captured; wait for the new run to start before judging. **No-progress timeout bound**: If the same check shows **no status change for 30+ minutes** (`pending` unchanged / `in_progress` with no step log progress), suspect manual approval pending / queue hang / runner shortage / execution hang and HOTL escalate (loop prevention). Cover **both pending and in_progress with unmoving step logs** under the same bound. Form: "CI run `<id>` has been `<elapsed-minutes>` in `<pending or in_progress>` with no progress. Possible causes: manual approval needed / queue hang / runner shortage / execution hang. Check manually with `gh run view <id> --web`. After fixing, re-run `/pr-codex-ci <PR-number>`."
+   - Failed → identify why the check failed (get run-id from the failed check URL or `gh run list --commit <SHA> --json databaseId`; see failed log with `gh run view <run-id> --log-failed`. Don't use bare `gh run view` as it hangs in interactive TUI).
+   - 0 checks → right after push, unconfigured CI may temporarily show 0 checks. If still 0 after a wait, treat as CI unset and skip (avoid mis-judging transient 0-checks as "no CI" and marking merge-ready).
 
-4. **判定とループ**:
-   - **採用すべき codex 指摘あり、または CI 失敗** → 修正（Edit）→ `git status --short` で diff を確認 → `git add <修正対象ファイル...>`（pathspec を明示。bare `git add` は何も stage しない / `git add -A` は user の別目的の変更も混入させうるため、対象ファイルを 1 つずつ指定する）→ `git commit -m "<件名>"`（`-m` / `-F` 必須。bare `git commit` は editor を開き対話 hang する）→ `git push` → **手順 2 に戻る**（新 head で再評価）。前 round で却下した指摘は再採用しない。
-     - **修正後も同じ指摘 / CI 失敗が続く / 修正不能** な場合は loop を止めて HOTL escalate（無限ループ回避）。「次どうしますか？」ではなく **何が起きたか + 必要な人間操作** を明示。例: 「CI の `<check 名>` が修正後も同じ理由 (`<要旨>`) で失敗します。手動確認が必要です。失敗 log: `<URL>`。」「conflict が `<file>` で自動解決不能。`.worktrees/<branch>/` で手動解決後、`/pr-codex-ci <PR番号>` を再度叩いてください。」
-   - **採用すべき codex 指摘が無く（LGTM / 残りは却下のみ）、CI green（or 未設定）** → **ここで停止せず手順 5 に進む**（local gate = codex + CI は通ったが、GitHub bot review gate が未確認のため最終 merge-ready 判定はまだ）。codex が非 LGTM でも残る指摘が nice-to-have / 却下のみなら local gate clean とする。
+4. **Judgment and loop**:
+   - **There are adoptable codex findings or CI failed** → fix (Edit) → confirm diff with `git status --short` → `git add <affected-files...>` (explicit pathspec; bare `git add` stages nothing / `git add -A` may include unintended user changes; list target files one by one) → `git commit -m "<subject>"` (`-m` / `-F` required; bare `git commit` opens editor and hangs) → `git push` → **return to step 2** (re-evaluate with new head). Don't re-adopt findings rejected in the previous round.
+     - **If the same finding / CI failure persists after fix, or cannot be fixed**, stop the loop and HOTL escalate (loop prevention). State **what happened + necessary human action**, not "what's next?". Example: "CI check `<name>` still fails after fix for the same reason (`<summary>`). Manual review needed. Failure log: `<URL>`." "Conflict at `<file>` cannot be auto-resolved. Resolve manually in `.worktrees/<branch>/`, then re-run `/pr-codex-ci <PR-number>`."
+   - **No adoptable codex findings (LGTM / remaining are rejections only), CI green (or unset)** → **don't stop here; advance to step 5** (local gate = codex + CI passed, but GitHub bot review gate not yet confirmed; final merge-ready not yet). If codex remains non-LGTM but remaining findings are nice-to-have / rejections only, consider local gate clean.
 
-5. **GitHub bot review gate（leaf `/pr-review-respond` を compose）**: 手順 4 で local gate が clean になったら、**確認を待たず leaf skill `/pr-review-respond <PR番号>` を 1 段下として invoke** する（[../../../rules/skills.md](../../../rules/skills.md) の orchestrator → leaf 規則。本 skill = orchestrator、`/pr-review-respond` = leaf）。`/pr-review-respond` は GitHub に post された bot review (Copilot / chatgpt-codex-connector / qodo 等) を取りに行き、採否判断 → reply + resolve → **structured result を返して終了**する。`/pr-review-respond` 自身は本 skill を呼び戻さない（cycle 回避）。
+5. **GitHub bot review gate (compose leaf `/pr-review-respond`)**: When local gate is clean at step 4, **invoke leaf skill `/pr-review-respond <PR-number>` without waiting for confirmation** (orchestrator → leaf rule from [../../../rules/skills.md](../../../rules/skills.md); this skill = orchestrator, `/pr-review-respond` = leaf). `/pr-review-respond` fetches bot reviews posted to GitHub (Copilot / chatgpt-codex-connector / qodo, etc.), decides accept/reject → replies + resolves → **returns structured result and exits**. `/pr-review-respond` itself doesn't call back this skill (cycle prevention).
 
-   `/pr-review-respond` の返り値 (structured result) を見て本 skill が次の挙動を判断する:
+   Based on `/pr-review-respond`'s return value (structured result), this skill determines next behavior:
 
-   - **`pushed_changes: true`**（code 修正を commit/push した）→ 新 head になったため**本 skill 手順 1 から再評価**（codex + CI を再評価 → 残れば手順 5 でまた `/pr-review-respond` を呼ぶ、の orchestrator loop）
-   - **`pushed_changes: false` + 全 thread resolved + 新規 review settle**（reply/resolve のみで code 変更なし、かつ remote gate clean）→ **手順 3 の CI gate を再確認**してから（`/pr-review-respond` は CI 緑を判定せず、その settle 待ちが CI 状態遷移を跨ぎうるため）**最終 merge-ready を報告して停止**（自動 merge はしない。merge は人間判断）。再確認で CI が失敗/退行していたら手順 4 の CI 失敗 path（修正 → 手順 1 から再評価）へ戻る
-   - **HOTL escalate**（`/pr-review-respond` の採否判断不能 / 修正不能 等）→ 本 skill も停止して escalate メッセージをそのまま受け流す
+   - **`pushed_changes: true`** (committed/pushed code fixes) → new head, so **re-evaluate from step 1** (codex + CI re-evaluated → if findings remain, invoke `/pr-review-respond` again at step 5; orchestrator loop)
+   - **`pushed_changes: false` + all threads resolved + new review settled** (only replies/resolves, no code changes, remote gate clean) → **re-check step 3's CI gate** before (because `/pr-review-respond` doesn't judge CI green; settling may cross CI state transitions) **reporting final merge-ready and stopping** (no automatic merge; merge is human judgment). If re-check shows CI failure/regression, return to step 4's CI failure path (fix → re-evaluate from step 1)
+   - **HOTL escalate** (`/pr-review-respond` cannot decide / cannot fix, etc.) → stop this skill and pass through escalate message as-is
 
-> **責務分離は維持しつつ orchestrator が leaf を compose する形で cycle を回避**: 「ローカルで codex を能動的に呼ぶ second opinion（本 skill = orchestrator）」と「PR に既に post された他者の review を取りに行って resolve する（`/pr-review-respond` = leaf）」は別の行為のため独立 skill のまま。orchestrator が leaf を呼び、leaf は structured result を返すだけで上を呼び戻さない（[../../../rules/skills.md](../../../rules/skills.md) の「呼び出しは上→下のみ、循環禁止」）。本 skill 最終 `merge-ready` 報告 = local gate (codex + CI clean) + remote gate (全 thread resolved + 新規 review settle) の AND 状態。**「local gate clean = merge-ready」と誤読して停止しない**（過去にこの誤読で「実装フェーズ完了」報告 → 数時間放置 → user が「bot review きてそう」と nudge して再開、という事故が発生した）。
+> **Maintain responsibility separation while orchestrator composes leaf to avoid cycles**: "Actively invoking codex locally for second opinion (this skill = orchestrator)" and "fetching reviews already posted on PR to resolve (` /pr-review-respond` = leaf)" are separate acts, so remain independent skills. Orchestrator calls leaf; leaf returns structured result without calling back (top→bottom only, no cycles per [../../../rules/skills.md](../../../rules/skills.md)). Final `merge-ready` report from this skill = local gate (codex + CI clean) AND remote gate (all threads resolved + new review settled). **Don't mis-read "local gate clean = merge-ready" and stop** (a prior accident: mis-read led to "implementation complete" report → hours of idling → user nudged "bot review arrived" → restart; that was bad).
 
-## トラブルシューティング
+## Troubleshooting
 
-| 問題 | 対処 |
-|------|------|
-| `/a2a-review` が reviewer 未到達で停止 | 案内に従い host で `bash scripts/dev.sh <box-name>` を再起動 (`<box-name>` は box 内 `echo $SANDBOX_VM_ID` の literal で置換、host shell では env が無く空展開する)。原因を追うときは host の `.claude/tmp/cdx-serve-<box-name>.log` (pair-serve 出力) を確認 |
-| CI が長時間 pending | `gh pr checks <PR番号>` を間隔を置いて再確認。run が hang していないか確認 |
-| codex が広範な改善提案を返す | nice-to-have / 将来用は採用しない。correctness / security / regression のみに絞る（addition bias 回避） |
-| PR が解決できない | 現在の branch が push 済みで PR があるか確認。無ければ先に PR を作成する |
-| sandbox box の中で動かしている | sandbox box (`bash scripts/dev.sh sandbox`) は host checkout を mount しないため reviewer が動作しない。`bash scripts/dev.sh attach` で既存 dev box に attach し直すか、`bash scripts/dev.sh` で新規 dev box を起動する |
+| Issue | Solution |
+|------|----------|
+| `/a2a-review` stops, reviewer unreachable | Follow the guidance; restart `bash scripts/dev.sh <box-name>` on host (replace `<box-name>` with the literal output of `echo $SANDBOX_VM_ID` inside the box; host shell has no such env, so empty expansion happens). To debug, check host's `.claude/tmp/cdx-serve-<box-name>.log` (pair-serve output) |
+| CI pending for extended time | Re-check `gh pr checks <PR-number>` at intervals. Verify if the run is hanging |
+| Codex returns broad improvement suggestions | Don't adopt nice-to-have / future suggestions. Narrow to correctness / security / regression only (avoid addition bias) |
+| PR cannot be resolved | Verify current branch is pushed and PR exists. If not, create PR first |
+| Running inside a sandbox box | Sandbox box (`bash scripts/dev.sh sandbox`) doesn't mount host checkout, so reviewer doesn't work. Re-attach to existing dev box with `bash scripts/dev.sh attach` or start a new dev box with `bash scripts/dev.sh` |

@@ -1,88 +1,59 @@
-# 決定記録: 安全に並列化した coding agent / HOTL の実行基盤
+# Decision Record: Execution platform for safely parallelized coding agents and HOTL
 
-**ステータス: Accepted（2026-06-18）** — 下記「検証ゲート (spike)」を実機で通過し、sbx (Docker Sandboxes) を実行基盤として採用。これに伴い [devcontainer-sandbox.md](devcontainer-sandbox.md) の `.devcontainer/` は撤去した（soft boundary は並列 HOTL に構造的に不足するため、2 系統を持たない = YAGNI）。検証結果は末尾「検証ゲート (spike)」の各項に記録。
+**Status: Accepted (2026-06-18)** — Passed verification gate (spike) on real hardware and adopted sbx (Docker Sandboxes) as the execution platform. Correspondingly, the `.devcontainer/` from [devcontainer-sandbox.md](devcontainer-sandbox.md) has been removed (soft boundary is structurally insufficient for parallel HOTL, so we maintain only one system = YAGNI). Verification results are recorded in each item under "Verification Gate (spike)" at the end.
 
-## 背景: 目的の明確化
+## Background: Clarifying the goal
 
-[devcontainer-sandbox.md](devcontainer-sandbox.md) は `.devcontainer/` を「Claude Code を隔離環境で安全に回す
-実行基盤」として main に置く決定で、教材性は限界節の「teaching workshop 用途として defense-in-depth で受容する」に
-留まる。本記録はこの「自作 sandbox を安全な実行基盤とする」前提を、オーナーが表明した**目的の更新**で上書きする:
+[devcontainer-sandbox.md](devcontainer-sandbox.md) made the decision to place `.devcontainer/` in main as "an execution platform to safely run Claude Code in an isolated environment," with educational value limited to the boundary condition of "accepted for teaching workshop purposes with defense-in-depth." This record overrides that "self-made sandbox as a safe execution platform" premise with an **updated goal** announced by the owner:
 
-> 目指すのは **安全に並列化した coding agent**、そして **HOTL (Human-On-The-Loop)**。
+> The goal is **safely parallelized coding agents**, and **HOTL (Human-On-The-Loop)**.
 
-つまりゴールは「sandbox の primitive を教えること」ではなく「**多数の agent を安全に並列で回し、人間は逐次承認ではなく
-監視・介入の立場 (on the loop) に立つ**」運用を成立させること。教材はその destination に到達するための手段。
+In other words, the goal is not "teaching the primitives of sandboxing" but "**safely running multiple agents in parallel, with humans taking a monitoring and intervention stance (on the loop) rather than sequential approval**" operationally. The learning material is a means to reach that destination.
 
-## 判断軸: HOTL は「境界の硬さ」を要求する
+## Decision axis: HOTL requires "hard boundaries"
 
-HOTL の本質は **1 アクションごとの人間承認ゲートを外す** こと（= 既存 box-primary の YOLO 運用の延長）。
-承認ゲートが無くなると、安全性は **境界が「侵害された agent」に対して持ちこたえるか** だけで決まる。
-並列度が上がるほど「全 agent を常時凝視する」のは非現実的になり、**監視の薄さを境界の硬さで補う** 必要がある。
+The essence of HOTL is **removing the human approval gate for each action** (= extension of existing box-primary YOLO operations). Without the approval gate, safety depends solely on **whether the boundary can withstand a "compromised agent"**. As parallelism increases, constantly watching all agents becomes impractical, so **we need hard boundaries to compensate for thinner monitoring**.
 
-## 現状 (自作 devcontainer) の限界
+## Current limitations (self-made devcontainer)
 
-自作 firewall は **defense-in-depth であって hard boundary ではない**。箱の中の `node` は passwordless root sudo と
-docker 権限を持つため、乗っ取られた agent は `sudo iptables -F` / `docker run --network host` で egress を破壊できる
-（[devcontainer-sandbox.md](devcontainer-sandbox.md) 「限界」参照）。**人間が密に監視していれば**気づけるが、
-**並列 HOTL では監視が薄くなる**ため、soft boundary は構造的に不足する。
+A self-made firewall is **defense-in-depth, not a hard boundary**. The `node` process in the container has passwordless root sudo and Docker privileges, so a compromised agent can destroy egress with `sudo iptables -F` / `docker run --network host` (see [devcontainer-sandbox.md](devcontainer-sandbox.md) "Limitations"). **If humans monitored closely**, they would notice, but **in parallel HOTL monitoring becomes thinner**, so soft boundaries are structurally insufficient.
 
-## 候補比較
+## Candidate comparison
 
-| 観点 | 自作 devcontainer | Docker Sandboxes (sbx) |
-|------|------------------|------------------------|
-| 並列 | worktree ごと box（手組み・可） | clone mode / 複数 microVM（並列がファーストクラス） |
-| HOTL の安全境界 | **soft**（root agent が破れる）→ 密な監視前提 | **hard**（hypervisor 境界、VM 内 root でも破れない） |
-| credential | 箱内（scope で律速） | 箱外注入（sentinel + proxy）が既定で真の隔離。但し proxy 注入の対象は API key のみで、サブスク認証（claude サブスク = 箱内 /login、codex サブスク = auth.json 転送）はトークンが箱内に入る（sbx/README.md の security 注記参照） |
-| microservices | DinD で箱内 compose 可 | sandbox 内 Docker engine で箱内 compose 可 |
-| 配布 | repo に同梱（clone だけ）+ host に Docker | host に sbx を別途導入（brew/winget）+ 認証 |
-| 成熟度 | 自前管理 | GA 2026-01-30（新しめ）。商用 pricing は未確定 |
+| Aspect | Self-made devcontainer | Docker Sandboxes (sbx) |
+|--------|------------------------|------------------------|
+| Parallelism | One box per worktree (manual assembly, possible) | Clone mode / multiple microVMs (parallelism is first-class) |
+| HOTL safety boundary | **soft** (root agent can break it) → requires dense monitoring | **hard** (hypervisor boundary, cannot be broken even by root in VM) |
+| Credentials | In container (constrained by scope) | Out-of-container injection (sentinel + proxy) is default for true isolation. However, proxy injection targets only API keys; subscription auth (Claude subscription = /login in-container, Codex subscription = auth.json transfer) puts tokens in-container (see sbx/README.md security note) |
+| Microservices | Can run docker compose in-container via DinD | Can run docker compose in-container via Docker engine in sandbox |
+| Distribution | Bundled in repo (clone only) + Docker on host | Separate sbx installation on host (brew/winget) + authentication |
+| Maturity | Self-managed | GA 2026-01-30 (new). Commercial pricing unconfirmed |
 
-sbx は "Run AI Coding Agents **Safely**" を掲げ、**microVM-per-agent の hypervisor 境界**を中核とする。
-「承認ゲートを外して並列で回す」用途に対し設計思想が直接一致する。一方、host への別途導入と認証が要り
-「clone するだけ」原則からは外れる。
+sbx emphasizes "Run AI Coding Agents **Safely**" with **microVM-per-agent hypervisor boundaries** as its core. The design philosophy directly aligns with the use case of "removing approval gates and running in parallel." However, it requires separate installation and authentication on host, departing from the "clone only" principle.
 
-## 方向 (Accepted)
+## Direction (Accepted)
 
-1. **実行基盤は sbx を採用する**。HOTL の安全要件（侵害 agent に持ちこたえる hard boundary）と
-   並列のしやすさ（microVM-per-agent）に対し purpose-built のため。`sbx/` に中立 `shell-docker` base の
-   カスタム image（claude/codex 同梱）と codex egress mixin を置き、**built-in claude agent**
-   （claude は API key を proxy 注入、サブスクは箱内 /login）で `sbx run claude -t coding-agent-playbook-sbx --kit ./sbx/playbook-kit .`
-   起動する。codex のサブスクは host の `~/.codex/auth.json` を box に転送して使う（sbx/README.md 参照）。
-2. **devcontainer (`.devcontainer/`) は撤去した**。sbx が spike を通過し採用された以上、劣る soft-boundary 側を
-   残す既定の理由はない（YAGNI: sandbox を 2 系統持たない）。存続させる例外（配布障壁: sbx は host 導入＋認証が
-   要るため「Docker のみで動く devcontainer を no-install fallback として残す」）も、**オーナー判断でその障壁を
-   非問題とした**（spike #3 参照）ため適用せず撤去。「層を理解する教材として残す」は当初から存続理由にしない方針。
-3. **PAT の scope 絞りは sbx 採用後も必須**。hypervisor 境界は token の流出・脱出は止めるが、
-   乗っ取られた agent が **scope 内で git push する悪用は止まらない**（HOTL は人間ゲートが無い分むしろ重要）。
-   fine-grained・対象 repo 限定・短命 PAT を併用する。
+1. **Adopt sbx as the execution platform**. It is purpose-built for HOTL safety requirements (hard boundary that withstands compromised agents) and ease of parallelism (microVM-per-agent). Place a custom image (with Claude/Codex bundled) with neutral `shell-docker` base and Codex egress mixin in `sbx/`, and launch with **built-in Claude agent** (Claude with API key proxy-injected, subscription /login in-container) via `sbx run claude -t coding-agent-playbook-sbx --kit ./sbx/playbook-kit .`. For Codex subscription, transfer host `~/.codex/auth.json` to the box (see sbx/README.md).
+2. **Devcontainer (`.devcontainer/`) has been removed**. Once sbx passes spike and is adopted, there is no default reason to keep the inferior soft-boundary side (YAGNI: do not maintain two sandbox systems). The exception to maintain it (distribution barrier: since sbx requires host installation + authentication, "keep devcontainer that works with Docker only as no-install fallback") does not apply because **the owner determined that barrier as non-issue** (see spike #3), so it was removed. "Keep as teaching material to understand layers" was never a retention reason from the start.
+3. **PAT scope narrowing is still essential after sbx adoption**. The hypervisor boundary stops token exfiltration, but it does not stop compromised agents from **misusing git push within scope** (HOTL makes this more important since there is no human gate). Use fine-grained, repo-scoped, short-lived PATs.
 
-## 残差 (隔離しても消えない)
+## Residual (survives even with isolation)
 
-- **scope 内悪用**: 上記 3 のとおり、sbx でも token の scope 内での悪用（malicious commit / PR）は残る。
-  blast radius は token の scope が律速。
-- **許可ドメイン経由 exfil**: GitHub 許可 → gist 等は両構成で残る。
+- **Misuse within scope**: As mentioned in 3 above, even with sbx, malicious commit / PR within token scope remains. Blast radius is constrained by token scope.
+- **Exfiltration via allowed domains**: GitHub allowed → gist etc. remains for both configurations.
 
-## 検証ゲート (spike) — 結果（2026-06-18 実機検証で通過）
+## Verification Gate (spike) — Results (2026-06-18 passed real-world verification)
 
-macOS arm64 / sbx v0.32.0 で確認（sbx プラットフォームのゲート。現行構成は `sbx/` の shell-docker base カスタム image + multi-agent kit `playbook-kit`）。
+Verified on macOS arm64 / sbx v0.32.0 (sbx platform gate. Current configuration: shell-docker base custom image in `sbx/` + multi-agent kit `playbook-kit`).
 
-1. ✅ **sbx 導入 → clone-mode sandbox 起動**: `sbx create --name <box> claude -t coding-agent-playbook-sbx --kit ./sbx/playbook-kit --clone .` で複数箱を並存起動。
-2. ✅ **並列 YOLO**: 複数 box を独立に起動し並走（box ごと 1 セッション、`sbx run <box>` で attach）。
-3. ✅ **コスト / multi-user**: sbx は各自マシンでローカル実行（per-box 中央課金なし）。ローカル使用は実質無料
-   （free Docker account の login のみ）、有料は不要な enterprise governance（Admin Console / AI Governance）のみ。
-   実質的な並列上限は課金でなく各自の RAM（microVM-per-agent は RAM を食う。`--memory` で box ごとに絞る）。
-   オーナー判断でコスト / 規模は非問題とした。残差: 公式 pricing 未確定（GA 2026-01-30 の新 product）。
-4. ✅ **観測・介入 (HOTL の要)**: `sbx ls`（全 box の status / ports）・`sbx exec`（read-only 覗き）・`sbx run`
-   （attach 介入）・`sbx ports --publish`（host browser）で、1 オペレータが数個の box を on the loop で回す用途に
-   十分。ローカルにライブ集約 dashboard は無い（aggregated UI は有料 Admin Console のみ）が nice-to-have で blocker でない。
-5. ✅ **host から in-sandbox dev server 閲覧**: 箱内 8080 を `sbx ports <box> --publish 8080` で host
-   `127.0.0.1:<port>` に公開し、host curl / headful chrome で到達確認（escape hatch 成立）。
-6. ✅ **箱内 compose stack（2 サービス）**: 箱内 docker (29.5.3) + compose (v5.1.4) で nginx + alpine の
-   inter-service 疎通 OK。nested container の直接 egress も VM 境界で遮断（allowlist bypass 不能）を確認。
+1. ✅ **sbx installation → clone-mode sandbox launch**: Launch multiple boxes in parallel with `sbx create --name <box> claude -t coding-agent-playbook-sbx --kit ./sbx/playbook-kit --clone .`.
+2. ✅ **Parallel YOLO**: Launch multiple boxes independently and run in parallel (1 session per box, attach with `sbx run <box>`).
+3. ✅ **Cost / multi-user**: sbx runs locally on each machine (no per-box central billing). Local usage is essentially free (only free Docker account login needed); paid tier is only for unnecessary enterprise governance (Admin Console / AI Governance). Practical parallelism ceiling is each user's RAM, not billing (microVM-per-agent consumes RAM; limit per box with `--memory`). Owner determined cost/scale as non-issue. Residual: official pricing unconfirmed (new product as of GA 2026-01-30).
+4. ✅ **Observation and intervention (HOTL requirement)**: `sbx ls` (all box status/ports), `sbx exec` (read-only peek), `sbx run` (attach intervention), `sbx ports --publish` (host browser) are sufficient for one operator to manage several boxes on the loop. No live aggregated dashboard locally (aggregated UI only in paid Admin Console), but that is nice-to-have, not a blocker.
+5. ✅ **Viewing in-sandbox dev server from host**: Expose in-container port 8080 to host `127.0.0.1:<port>` with `sbx ports <box> --publish 8080`, verified reachability via host curl / headful Chrome (escape hatch established).
+6. ✅ **Compose stack in-sandbox (2 services)**: Docker (29.5.3) + compose (v5.1.4) inside container with nginx + alpine inter-service communication OK. Verified nested container direct egress also blocked at VM boundary (allowlist bypass impossible).
 
-補足（egress 境界）: 箱内 runtime は default-deny + allowlist（anthropic / github / npm / docker は許可、それ以外は
-proxy が 403 で能動拒否）。HTTP proxy `gateway.docker.internal:3128` 経由で TLS 傍受。コールド起動直後は proxy /
-DinD が温まりきらず transient な失敗が出るが温まれば安定。
+Note (egress boundary): In-container runtime uses default-deny + allowlist (anthropic / github / npm / docker permitted, others actively denied by proxy with 403). TLS interception via HTTP proxy `gateway.docker.internal:3128`. Transient failures appear immediately after cold start as proxy / DinD warm up, but stable once warmed.
 
 ## Sources
 

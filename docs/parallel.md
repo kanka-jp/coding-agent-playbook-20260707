@@ -1,133 +1,133 @@
-# 並列開発と発展的な使い方
+# Parallel Development and Advanced Usage
 
-[README](../README.md) §2 の基本パターン (`bash scripts/dev.sh` で 1 個の bind-mount dev box に入る) から外れる使い方:
+Usage patterns diverging from basic pattern in [README](../README.md) §2 (`bash scripts/dev.sh` enters single bind-mount dev box):
 
-- box の中の shell に入る (claude を経由しない)
-- 複数 dev box を並列で立てる (本番作業を並列に進める / pair reviewer 連動)
-- sandbox box (`--clone .` 隔離) で ad-hoc 探索 (`/pr-codex-ci` は使えない)
-- dev server を名前で見分ける (Traefik 経由)
+- Enter shell inside box (bypassing claude)
+- Launch multiple dev boxes in parallel (run production work in parallel / pair reviewer coordination)
+- Sandbox box (`--clone .` isolation) for ad-hoc exploration (`/pr-codex-ci` unavailable)
+- Distinguish dev servers by name (via Traefik)
 
-## box の中の shell に入る (claude を経由しない)
+## Enter shell inside box (bypassing claude)
 
-別ターミナルで `bash scripts/dev.sh ls` で名前を確認し、対象の box に shell で入る:
+In separate terminal, confirm name with `bash scripts/dev.sh ls`, then enter shell in target box:
 
 ```bash
-bash scripts/dev.sh ls                     # dev box 一覧 (#, NAME, CDX 状態)
-bash scripts/dev.sh shell <NAME>           # その box の対話 bash に入る (NAME 必須)
+bash scripts/dev.sh ls                     # List dev boxes (#, NAME, CDX status)
+bash scripts/dev.sh shell <NAME>           # Enter interactive bash in that box (NAME required)
 # Windows: powershell -ExecutionPolicy Bypass -File scripts/dev.ps1 shell <NAME>
 ```
 
-claude セッションと**並走可能** (`exit` / `Ctrl+D` で shell だけ抜けても claude / box は生きたまま)。`sbx exec -it <box> bash` の薄い wrapper。stage worktree の再展開や debugging で `setup-worktrees.sh` を直接叩きたい時、または下の sandbox box にも shell で入りたい時 (`bash scripts/dev.sh shell <生成された名前>`) に使う。
+**Can run in parallel with** claude session (exiting shell with `exit` / `Ctrl+D` leaves claude / box alive). Thin wrapper over `sbx exec -it <box> bash`. Use when directly running `setup-worktrees.sh` for stage worktree re-expansion or debugging, or when entering shell in sandbox box below (`bash scripts/dev.sh shell <generated-name>`).
 
-## 並列で複数 dev box を立てる (本番作業 / pair reviewer 連動)
+## Launch multiple dev boxes in parallel (production work / pair reviewer coordination)
 
-`scripts/dev.sh` を**引数なし**で複数回叩くと、毎回別の auto-named (`<basename>-<hex6>`、例: `coding-agent-playbook-7a3f29`) dev box が立ち、それぞれ独立した `cdx-<NAME>` reviewer pair を持つ (port も独立 dynamic ephemeral)。並列で `/pr-codex-ci` を回せる。
+Running **no-args** `scripts/dev.sh` multiple times creates each with a separate auto-named (`<basename>-<hex6>`, e.g. `coding-agent-playbook-7a3f29`) dev box, each with independent `cdx-<NAME>` reviewer pair (ports also independent, dynamic ephemeral). Can run `/pr-codex-ci` in parallel.
 
-dev box の `<NAME>` は予約 prefix `cdx-*` (reviewer pair) と `sbx-*` (sandbox auto-name) を使えない (`dev.sh` は validation で reject する)。下記 sandbox の用途と namespace 分離するため。
+Dev box `<NAME>` can't use reserved prefixes `cdx-*` (reviewer pair) and `sbx-*` (sandbox auto-name) (`dev.sh` rejects on validation). Namespace separation from sandbox use below.
 
 ```bash
-bash scripts/dev.sh                        # 別ターミナルで複数回叩くと別々の dev box + cdx pair が立つ
-bash scripts/dev.sh ls                     # 立っている dev box を一覧
-bash scripts/dev.sh attach <N>             # ls の N 番目に再 attach
+bash scripts/dev.sh                        # Multiple runs in separate terminals create separate dev boxes + cdx pairs
+bash scripts/dev.sh ls                     # List running dev boxes
+bash scripts/dev.sh attach <N>             # Re-attach to Nth item in ls
 # Windows: powershell -ExecutionPolicy Bypass -File scripts/dev.ps1
 ```
 
-明示名で立てたい場合 (`task-a` / `task-b` 等の意図を名前に込めたい場合) は引数を渡す:
+For explicit names (`task-a` / `task-b` etc to encode intent in name), pass arguments:
 
 ```bash
-bash scripts/dev.sh task-a                 # 明示名で idempotent attach-or-create
+bash scripts/dev.sh task-a                 # Idempotent attach-or-create by explicit name
 bash scripts/dev.sh task-b
 ```
 
-dev box を停止するときは `bash scripts/dev.sh kill <NAME|N>` (cdx-`<NAME>` reviewer pair も同時に破棄)。auto-teardown が走らずに orphan reviewer pair / stale lease / stale lock が残った場合は **`bash scripts/dev.sh prune`** (引数なしで dry-run、`--yes` で実行) が一括 cleanup する (個別に `sbx rm -f cdx-<NAME>` + `rm .claude/tmp/cdx-*` を叩く代わり)。**`--all` flag** で「CDX=none な dev box 本体」(`ls` に出るが cdx pair を持たない蓄積した box) も candidate に追加 (Docker `image prune --all` 類比)。安全 guard 3 段: (1) cdx pair 持ち は別経路で扱う、(2) active dev lock 持ち は in-flight 起動として除外、(3) `sbx ls --json` で `status=running` の box は除外 (`dev.sh shell` 経由 / 直接 `sbx exec` 中等で lock を持たない attach も保護、`skipped (running, --all mode)` section で別表示)。さらに delete 直前に running を**再 snapshot** して scan→delete window の race も防ぐ。**fail-closed**: bash 版は `jq` 必須 + `sbx ls --json` 取得/parse 失敗で `--all` を refuse して exit (degrade して filter なしで誤削除するより安全側)、PowerShell 版は built-in `ConvertFrom-Json` で同じ fail-closed 規範。一覧の name だけ取りたい時は **`ls -q`** (Docker `docker ps -aq` 互換、`xargs` 等で advanced 用途に open)。
+Stop dev box with `bash scripts/dev.sh kill <NAME|N>` (also destroys cdx-`<NAME>` reviewer pair). If auto-teardown didn't run leaving orphan reviewer pairs / stale leases / stale locks, **`bash scripts/dev.sh prune`** batch-cleanups (no args = dry-run, `--yes` = execute) instead of individual `sbx rm -f cdx-<NAME>` + `rm .claude/tmp/cdx-*`. **`--all` flag** adds "dev box itself with CDX=none" (appears in `ls` but lacks cdx pair, accumulated boxes) as candidate (Docker `image prune --all` analogy). 3-tier safety guards: (1) boxes with cdx pairs handled via separate path, (2) active dev locks excluded as in-flight launches, (3) boxes with `status=running` in `sbx ls --json` excluded (protects lock-less attach via `dev.sh shell` / direct `sbx exec`, shown separately in `skipped (running, --all mode)` section). Further, re-snapshots running status right before delete to prevent scan→delete race. **Fail-closed**: bash version requires `jq` + refuses `--all` and exits on `sbx ls --json` fetch/parse failure (safer than degrading with no filtering and mis-deleting), PowerShell version uses built-in `ConvertFrom-Json` with same fail-closed principle. For just-names list, **`ls -q`** (Docker `docker ps -aq` compatible, open for advanced use with `xargs` etc).
 
-## 大量 issue を並列で捌く（運用保守フェーズ）
+## Handle large issue backlogs in parallel (operations & maintenance phase)
 
-初期実装（MVP）の後は、改善点を **issue 化 → 並列で潰す** フェーズに入る。issue の**出どころ**と**処理(dispatch)**がそれぞれ「手動 / ultracode」の2通りある。
+After initial implementation (MVP), enter phase to **convert improvements to issues → fix in parallel**. Issue **source** and **handling (dispatch)** each have 2 modes: "manual / ultracode".
 
-### 入力 issue の出どころ（いずれも coding agent が `gh issue create` する）
-起票そのものは人が `gh` を手打ちするより **claude に頼んで作る**のが通常（box から起票するには PAT に `Issues: Read and write` が要る。[docs/setup.md](setup.md)。無いと `Resource not accessible by personal access token (createIssue)`）。違いは「**何を**起票するか」の source:
-- **人主導（狙い撃ち・少数）**: 人が「ここを直したいので issue にして」と指示 → agent が起票。
-- **ultracode 発見（網羅・大量）**: 対象（例 stage の MVP）を次元別 finder agent で fan-out → adversarial verify → dedup した**検証済み backlog** を agent が起票（`ultracode` キーワードで Workflow にオプトイン）。
+### Issue sources (coding agent runs `gh issue create` for all)
+Filing itself: better to **ask claude than hand-type `gh`** (filing from box requires PAT with `Issues: Read and write`. [docs/setup.md](setup.md). Without it: `Resource not accessible by personal access token (createIssue)`). Difference is in **what to file**:
+- **Human-led (targeted, few)**: Human says "fix this, file an issue" → agent files it.
+- **Ultracode-found (comprehensive, many)**: Fan-out finder agents by dimension on target (e.g., stage MVP) → adversarial verify → deduplicate → agent files **verified backlog** (opt-in to Workflow with `ultracode` keyword).
 
-### ① 手動ペタペタ（人がディスパッチ）
-issue ごとに box を立て、issue 番号を貼って自走させる、を**繰り返す**:
+### ① Manual dispatch (human distributes)
+Repeat: launch box per issue, paste issue number, let it auto-run:
 
 ```bash
-bash scripts/dev.sh                     # auto-named dev box を起動（issue ごとに繰り返す＝並列度=box 数）
-# box の claude に（対象 checkpoint を明示し、専用 worktree を切らせる）:
-> <対象 stage>（例 stage/04-mvp）の issue #93 を、専用の worktree を切って直し PR まで出して
+bash scripts/dev.sh                     # Launch auto-named dev box (repeat per issue = parallelism = box count)
+# Tell box's claude (specify target checkpoint, have it cut dedicated worktree):
+> Fix issue #93 in <target stage> (e.g. stage/04-mvp), cut dedicated worktree and push PR
 ```
 
-claude は worktree→実装→PR→`/pr-codex-ci`→`/pr-review-respond` まで自走する（[CLAUDE.md](../CLAUDE.md)「開発フロー」の chain）。HOTL は statusLine の session id → host から transcript で監視。**素朴で確実だが、issue が多いと「立てて貼る」の繰り返しが手間**（→②へ）。
+Claude auto-runs worktree→implement→PR→`/pr-codex-ci`→`/pr-review-respond` ([CLAUDE.md](../CLAUDE.md) "Development flow" chain). HOTL monitors via statusLine session id → transcript from host. **Simple & reliable, but repetitive "launch & paste" tires with many issues** (→②).
 
-**①が repo 標準（clone だけで再現できる並列手順）**。②は下記のとおり Claude Code harness 利用時の発展形。
+**① is repo standard** (reproducible with just clone). ② is advanced form when using Claude Code harness below.
 
-> ⚠️ **①②共通の注意（stage を対象に並列するとき）**
-> - **worktree 隔離**: dev box は同じ host checkout（`.git` / `.worktrees/`）を bind-mount で共有する。共有 stage worktree（`.worktrees/<NN>/`）を直接編集させず、**issue ごとに別ブランチ＋別 worktree** を切らせる（box 間で worktree 名が衝突しないよう一意に）。
-> - **Closes が効かない**: `stage/*` は default branch でないため、これらの fix PR では **`Closes #N` の自動 close が効かない**（[GitHub 仕様](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue)）。issue は手動 close／本文で参照する。
-> - 対象 checkpoint 名は実ブランチに合わせる（`docs/instructor.md` の checkpoint 表は旧名のままで未整合 → 別途更新予定）。
+> ⚠️ **Common caution for ①② (when parallelizing against stages)**
+> - **Worktree isolation**: dev boxes share host checkout (`.git` / `.worktrees/`) by bind-mount. Don't edit shared stage worktree (`.worktrees/<NN>/`) directly; **cut separate branch + separate worktree per issue** (unique names across boxes to avoid collision).
+> - **`Closes` doesn't work**: since `stage/*` isn't default branch, fix PRs for them don't get **`Closes #N` auto-close** ([GitHub spec](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue)). Close issues manually / reference in body.
+> - Target checkpoint name matches real branch (`docs/instructor.md` checkpoint table still has old names, unaligned → plan to update separately).
 
-### ② ultracode で並列処理（発展 / Claude Code harness 利用時のみ）
+### ② Parallel via ultracode (advanced / Claude Code harness only)
 
-> ⚠️ **これは repo 同梱の機能ではない**。`ultracode` / `Workflow`（multi-agent orchestration）/ `isolation: 'worktree'` は **Claude Code harness が提供する機能**であって、本リポの script・skill ではない（clone しただけでは存在しない）。repo 標準の並列手順は①。②は Claude Code の中で回す時だけ使える。
+> ⚠️ **This is not bundled-in-repo functionality**. `ultracode` / `Workflow` (multi-agent orchestration) / `isolation: 'worktree'` are **Claude Code harness features**, not repo scripts/skills (don't exist after just cloning). Repo's standard parallel is ①. ② only works when running inside Claude Code.
 
-issue 一覧を渡すと **issue ごとに agent を fan-out** して並列に fix→PR を回せる（①の「box を立てて貼る」繰り返しが 1 コマンドに畳める）:
+Pass issue list, **fan-out agent per issue** to fix & PR in parallel (collapse ①'s "launch & paste" loop into 1 command):
 
 ```text
-> <対象 stage>（例 stage/04-mvp）の #92 #93 #94 #95 #96 #97 を ultracode で並列に直して
+> Parallel-fix #92 #93 #94 #95 #96 #97 in <target stage> (e.g., stage/04-mvp) with ultracode
 ```
 
-各 agent は `isolation: 'worktree'` で独立に fix（上記「worktree 隔離」を harness が自動で満たす形）。**収束（各 worktree の結果を1つにまとめる）も harness／人間側のオーケストレーションで行う**（repo に自動統合の機構は無い）。規模と conflict 次第で:
-- issue ごとに PR → 逐次 review/merge（本番 GitHub フローに近い。上記のとおり stage PR では `Closes` は効かない）
-- 1 本の checkpoint（例 stage/05-fixed）に統合 → 1 PR（デモが簡潔）
+Each agent fixes independently with `isolation: 'worktree'` (harness automatically satisfies worktree isolation above). **Convergence** (combining each worktree's results into one) **is handled by harness / human orchestration** (repo has no auto-integration mechanism). Depending on scale and conflicts:
+- Issue-per-PR → sequential review/merge (like production GitHub flow. As noted, `Closes` doesn't work for stage PRs)
+- Integrate into 1 checkpoint (e.g., stage/05-fixed) → 1 PR (cleaner demo)
 
-> ⚠️ **同一ファイルを触る issue は並列で conflict する**。file 独立な issue を選んで並列度を上げる／逐次 merge・conflict 解消を組み込む、のどちらかを設計する（issue を切る段階で「file が重ならない粒度」に束ねておくと並列が楽）。
+> ⚠️ **Issues touching same file conflict in parallel**. Either select file-independent issues to increase parallelism / design in sequential merge & conflict resolution. (Bundling issues at filing stage with "non-overlapping file granularity" makes parallelism easier).
 
-## sandbox box (`--clone .` 隔離 / ad-hoc 探索 / `/pr-codex-ci` は使えない)
+## Sandbox box (`--clone .` isolation / ad-hoc exploration / `/pr-codex-ci` unavailable)
 
-host から完全に切り離した throwaway box を立てたい場合 (A 案 / B 案の探索、リスクの高いコマンドの検証等) は `dev.sh sandbox` を使う。host checkout を mount しない private copy として起動するため、host のファイルを取り合う race は構造的に存在しない (parallel-safe)。
+For throwaway boxes completely isolated from host (exploring options A/B, verifying risky commands etc), use `dev.sh sandbox`. Launches as private copy not mounting host checkout, so file-contention races with host are structurally nonexistent (parallel-safe).
 
 ```bash
-bash scripts/dev.sh sandbox                # 引数なし: sbx-<basename>-<hex6> で毎回 fresh --clone
-bash scripts/dev.sh sandbox <NAME>         # 明示名で sandbox を create/attach
+bash scripts/dev.sh sandbox                # No args: fresh --clone each time as sbx-<basename>-<hex6>
+bash scripts/dev.sh sandbox <NAME>         # Explicit name: create/attach sandbox
 # Windows: powershell -ExecutionPolicy Bypass -File scripts/dev.ps1 sandbox [<NAME>]
 ```
 
-sandbox box は **`sbx-` prefix** で命名され、dev box の namespace (prefix なし) と完全分離する。明示名で `bash scripts/dev.sh sandbox <NAME>` を呼ぶ場合、`<NAME>` に `cdx-*` を含めることはできず、`sbx-*` は**既存 box ならば reattach、未存在ならば create** (auto-name 後の reattach 経路と、受講者が `sbx-task-a` 等の自前 prefix で sandbox を立てる経路の両方を保つため)。これにより `bash scripts/dev.sh <NAME>` がうっかり sandbox に attach する事故を構造的に防ぐ。`bash scripts/dev.sh ls` には sandbox box は出ない (dev box discovery が `sbx-*` を除外)。`sbx ls` で全 box を確認、`sbx rm -f <NAME>` で破棄する。
+Sandbox boxes are **`sbx-` prefixed**, completely separated from dev box namespace (no prefix). When calling `bash scripts/dev.sh sandbox <NAME>` with explicit name, can't include `cdx-*` in `<NAME>`; `sbx-*` **reattaches if existing, creates if not** (preserves both auto-name reattach path and participants launching own `sbx-task-a` prefixed sandboxes). Prevents accidental `bash scripts/dev.sh <NAME>` attaching to sandbox. `bash scripts/dev.sh ls` doesn't show sandbox boxes (dev box discovery excludes `sbx-*`). Confirm all boxes with `sbx ls`, destroy with `sbx rm -f <NAME>`.
 
-> ⚠️ **migration note**: 2026-06-27 の本 refactor 前に作られた旧 `dev.sh` no-arg = clone 由来の box (`<basename>-<hex6>` 形式、prefix なし) は、現在の design では **dev box として discovery される** が、実態は clone box (host checkout を mount していない)。`bash scripts/dev.sh <旧clone名>` で attach すると bind-mount のフリで起動してしまい、`/a2a-review` が stale diff をレビューする原因になる。**clone box 由来の旧 box は `sbx rm -f <NAME>` で一旦破棄してから新 dev.sh を使うこと**。新 design では clone box は必ず `sbx-` prefix で命名される (`dev.sh sandbox` 経由) ため、prefix なしの box は今後 bind-mount dev box のみとなる。
+> ⚠️ **Migration note**: Old boxes from pre-2026-06-27 refactor where `dev.sh` no-arg = clone (`<basename>-<hex6>` format, no prefix) are **discovered as dev boxes** in current design but actually clone boxes (no host checkout mount). Attaching with `bash scripts/dev.sh <old-clone-name>` pretends to bind-mount, causing `/a2a-review` to review stale diffs. **Destroy old clone boxes with `sbx rm -f <NAME>` before using new dev.sh**. New design always `sbx-` prefixes clone boxes (`dev.sh sandbox` route), so prefix-less boxes are now only bind-mount dev boxes.
 >
-> ⚠️ **既知の制約 (multi-checkout の cross-pollution)**: `bash scripts/dev.sh ls` / `prune` は `sbx ls` (host 全体の box 一覧) から予約 prefix を除外した結果を表示するため、**同マシン上で複数 clone / 別 project の checkout から dev.sh を起動した受講者には、別 checkout で作られた dev box / cdx pair も一覧に混ざる**。その状態で `dev.sh attach <N>` を叩くと、現 checkout の `cdx-<NAME>` を新規 provision したうえで別 checkout の box に attach し、`/a2a-review` が wrong tree を読むリスクがある。`prune --yes` も同様で、別 checkout の startup window 中の cdx pair を「現 checkout の lock が無いから orphan」と誤判定して削除する race がある (active dev lock check は **現 checkout の `.claude/tmp/` だけ**を見るため別 checkout の lock を知らない)。**workshop の通常運用 (1 マシン 1 checkout) では問題にならない**が、多 checkout 並用時は `sbx ls` で box 名を確認してから明示名で attach する / `prune --yes` の代わりに `prune` (dry-run) で出力を目視確認することを推奨。構造的解決 (project root ハッシュを box 名に含めて filter する設計改修) は別 issue で tracking ([#75](https://github.com/kanka-jp/coding-agent-playbook/issues/75))。
+> ⚠️ **Known limitation (multi-checkout cross-pollution)**: `bash scripts/dev.sh ls` / `prune` display `sbx ls` results (host-wide box list) minus reserved prefixes, so **participants launching dev.sh from multiple clones / project checkouts see dev boxes / cdx pairs created in other checkouts mixed in the list**. Calling `dev.sh attach <N>` then newly-provisions current checkout's `cdx-<NAME>` and attaches to other checkout's box, risking `/a2a-review` reading wrong tree. `prune --yes` similarly risks race: misidentifies cdx pairs from other checkout's startup window as orphans (because active dev lock check **only looks at current checkout's `.claude/tmp/`**, unaware of other checkout locks) and deletes them. **Normal workshop operations (1 machine, 1 checkout) unaffected**, but with multiple checkouts, recommended to confirm box names with `sbx ls` before attaching by explicit name / substitute `prune` (dry-run) for `prune --yes` and visually confirm output. Structural fix (include project root hash in box name for filtering) tracked in separate issue ([#75](https://github.com/kanka-jp/coding-agent-playbook/issues/75)).
 >
-> ⚠️ **`/pr-codex-ci` (codex review) は sandbox box では機能しない**: `/a2a-review` は **host の checkout を bind-mount** して codex に見せる設計のため、sandbox box の中で書いた / pushed branch を codex は inspect できず、stale / empty diff に対し LGTM を返す可能性がある。workshop の merge-ready flow を回したい時は `bash scripts/dev.sh` (bind-mount dev box) を使う。sandbox は **PR 化前の ad-hoc 用途** に限定する。
+> ⚠️ **`/pr-codex-ci` (codex review) doesn't work in sandbox boxes**: `/a2a-review` **bind-mounts host checkout** to show codex, so codex can't inspect branches written/pushed in sandbox box, possibly returning LGTM on stale/empty diffs. For merge-ready flow, use `bash scripts/dev.sh` (bind-mount dev box). Sandbox limited to **pre-PR ad-hoc use**.
 >
-> ⚠️ **sandbox box では stage worktree を改めて展開する必要がある**: `.worktrees/` は git 管理外で `--clone` のコピー対象に入らない ([README](../README.md) §1-3 で host に展開した状態は box に持ち込まれない)。sandbox box に入った直後に **box の中で** `bash scripts/internal/setup-worktrees.sh` を実行して `.worktrees/<NN>/` を作り直す (詳細は [rules/box-ops.md](../rules/box-ops.md))。dev box (bind-mount) では host の `.worktrees/` がそのまま見えるため不要。
+> ⚠️ **Sandbox boxes must re-expand stage worktrees**: `.worktrees/` is outside git and not copied by `--clone` ([README](../README.md) §1-3 host-expanded state doesn't come into box). Right after entering sandbox, **run inside box**: `bash scripts/internal/setup-worktrees.sh` to recreate `.worktrees/<NN>/` (details: [rules/box-ops.md](../rules/box-ops.md)). Dev box (bind-mount) sees host's `.worktrees/` directly, so unnecessary.
 
-## dev server をブラウザで見る
+## View dev server in browser
 
-**まず baseline（Traefik 不要・全員これで足りる）**: box の dev port を publish してそのまま開く。
+**First baseline** (no Traefik, everyone has enough): publish box dev port and open directly.
 
 ```bash
 sbx ports <box> --publish 3000:3000   # → http://localhost:3000
 ```
 
-名前付き URL（`web.<branch>.<repo>.localhost`）が欲しい時だけ、オプションで Traefik 層を使う:
+For named URLs (`web.<branch>.<repo>.localhost`), optionally use Traefik layer:
 
 ```bash
-# A) :80 が空いている → 自前 Traefik を一度起動して名前で見る
+# A) :80 free → launch own Traefik, view by name
 bash scripts/dev.sh route up
-bash scripts/dev.sh route add <box>             # name 既定 = <branch>.<repo> → web.<branch>.<repo>.localhost
-bash scripts/dev.sh route add <box> 3000 my.name  # name 明示（ドット区切り可）→ web.my.name.localhost
+bash scripts/dev.sh route add <box>             # Default name = <branch>.<repo> → web.<branch>.<repo>.localhost
+bash scripts/dev.sh route add <box> 3000 my.name  # Explicit name (dot-separated) → web.my.name.localhost
 
-# B) 既に共有 Traefik が :80 に居る（複数 project を 1 本で捌く定石）→ 自動検出して相乗り（自前は立てない）
-bash scripts/dev.sh route add <box>             # :80 の共有 Traefik を自動検出（env 指定不要・up 不要）
-bash scripts/dev.sh route detect                # 検出結果を確認
+# B) Shared Traefik already on :80 (standard for multiple projects on 1 server) → auto-detect and piggyback (don't launch own)
+bash scripts/dev.sh route add <box>             # Auto-detect :80 shared Traefik (no env needed, no up needed)
+bash scripts/dev.sh route detect                # Confirm detection
 # Windows: powershell -ExecutionPolicy Bypass -File scripts/dev.ps1 route <verb> <args>
 ```
 
-相乗り（B）は `:80` の file-provider Traefik を自動検出して経路をそこへ出し入れする（`up`/`down` は no-op、既存 Traefik 設定は変更不要）。自動検出できない構成（config file 指定など）は `BOX_ROUTING_DYNAMIC_DIR` / `BOX_ROUTING_DYNAMIC_VOLUME` で供給先を明示。配線・Traefik 構成・モードの詳細・Linux ネイティブ Docker での 502 注意は [tools/parallel-dev/box-routing/README.md](../tools/parallel-dev/box-routing/README.md) 参照。
+Piggybacking (B) auto-detects `:80` file-provider Traefik and routes in/out there (`up`/`down` are no-op, no changes to existing Traefik config). For configs that can't auto-detect (explicit config files etc), supply destination via `BOX_ROUTING_DYNAMIC_DIR` / `BOX_ROUTING_DYNAMIC_VOLUME`. Wiring, Traefik configuration, mode details, Linux native Docker 502 notes: [tools/parallel-dev/box-routing/README.md](../tools/parallel-dev/box-routing/README.md).
 
-**名前で見る必要が無ければ Traefik も `dev.sh route` subcommand も不要**（baseline で十分）。「box に入る」と「dev server を名前で見る」は別の関心事で、後者はオプション層。
+**No need for Traefik or `dev.sh route` subcommand if viewing by name isn't necessary** (baseline sufficient). "Entering box" and "viewing dev server by name" are separate concerns; the latter is optional layer.
 
-> 上記は**人がブラウザで見る**話。**agent に host の見える Chrome を CDP で操作させたい**（box session 維持のまま可視ブラウザを運転）なら別ツール [headful-bridge.md](headful-bridge.md)（`scripts/cdp-bridge.sh`）。攻撃面が増えるので opt-in + 使い捨て profile 限定（同 doc のセキュリティ節必読）。
+> Above is **for humans viewing in browser**. To **let agent drive host's visible Chrome via CDP** (maintain box session while operating visible browser), use separate tool [headful-bridge.md](headful-bridge.md) (`scripts/cdp-bridge.sh`). Increased attack surface, so opt-in + disposable profile only (read security section in that doc).

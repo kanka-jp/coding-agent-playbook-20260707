@@ -1,110 +1,110 @@
 # Code Comments
 
-## 原則
+## Principles
 
-編集するファイルの既存コメント慣習に従うこと。docstring があれば同様に書き、なければ追加しない。新規ファイルでは同ディレクトリの既存ファイルに従い、判断できなければコメントは書かない。
+Follow the existing comment conventions of the file you're editing. If docstrings exist, write similarly; if not, don't add them. For new files, follow existing files in the same directory; if you can't decide, don't write comments.
 
-コメントは「なぜ（why）」のみ簡潔に。WHAT / HOW の説明は識別子名と型シグネチャに任せる。**WHY もコードから自明に読み取れるなら書かない**（「WHY を書け」ではなく「自明でない WHY のみ書け」が正しいルール）。識別子名・型・周辺コードから推測可能な「なぜ」は、コメントにしても情報量を増やさず、コードが変わったときに古びるだけの負債になる。
+Comments should be concise and address only the "why". Leave WHAT / HOW explanations to identifier names and type signatures. **If WHY is self-evident from code, don't write it** ("write WHY" is not the correct rule; "write only WHY that isn't self-evident" is). "Why" that's deducible from identifier names, types, and surrounding code—when commented—adds no information and becomes debt when code changes.
 
-## 書かない具体的パターン
+## Specific Patterns to Avoid
 
-### 1. 識別子名を自然言語で言い換えるだけ
+### 1. Just Rephrasing Identifier Names in Natural Language
 
-識別子が示す情報をそのまま日本語/英語に変換した「定義」コメントは書かない。読み手はコードを読めば同じ情報を得られる。
+Don't write "definition" comments that convert what the identifier shows into Japanese/English. Readers get the same info by reading the code.
 
 ```go
-// 悪い例: 識別子名を日本語で言い換えただけ
-// UserSignupToken は signup 確認用トークンの永続化モデル
+// Bad: just rephrasing identifier name in Japanese
+// UserSignupToken is a persistence model of token for signup confirmation
 type UserSignupToken struct { ... }
 
-// 良い例: コメント削除
+// Good: remove comment
 type UserSignupToken struct { ... }
 ```
 
-なお、識別子名から読み取れない WHY (例: 検証完了まで users INSERT を遅延する設計理由) は残す価値があり、後述「書く価値がある WHY の例」に該当する場合は削除せず WHY だけに整理する。
+However, WHY not deducible from the identifier name (e.g., design reason for delaying users INSERT until verification is complete) deserves to remain. If it matches "Examples of WHY Worth Writing" below, keep it (don't delete) but organize as WHY only.
 
-### 2. 他のコードとの比較・対比
+### 2. Comparison / Contrast with Other Code
 
-「既存の X と異なり〜」「他の Y と違って〜」のような対比コメントは書かない。読み手は実際に X / Y を見て構造を理解するべきで、対比は WHAT / HOW の言い換えに過ぎない。さらに参照先のコードが将来変更されるとコメントだけが古くなって嘘になる。
+Don't write contrastive comments like "unlike existing X" or "different from other Y". Readers should examine X / Y directly and understand the structure themselves; contrasts are just WHAT / HOW rephrasing. Moreover, if referenced code changes later, the comment alone goes stale and becomes false.
 
 ```go
-// 悪い例: 既存実装との対比で説明
-// IssueSignupToken は既存の Email/Password update token (JWT) と異なり
-// DB レコードを SoT とするため、JWT 署名/検証は行わず opaque token を発行する。
+// Bad: explain via contrast with existing implementation
+// IssueSignupToken differs from existing Email/Password update token (JWT):
+// uses DB record as SoT, so issues opaque token without JWT signing/verification.
 func IssueSignupToken(...) { ... }
 
-// 良い例: 対比をやめ、独立した WHY を簡潔に
-// DB レコードを SoT として、消費後即時 hard-delete で revoke を担保するため opaque token を発行
+// Good: drop contrast, state independent WHY concisely
+// DB record as SoT; issue opaque token to guarantee revoke via immediate hard-delete after consumption
 func IssueSignupToken(...) { ... }
 ```
 
-### 3. 直後のコードが自明に語る処理説明
+### 3. Immediately Following Code Self-Evidently Explains the Operation
 
 ```go
-// 悪い例
-// 重複チェック用の既存ユーザーを登録。
+// Bad
+// Register existing user for duplicate check.
 existingUser := testutil.AddTestUser(...)
 
-// 悪い例
-// user_signup_tokens にレコードができている。
+// Bad
+// Record created in user_signup_tokens.
 assertUserSignupTokenFound(...)
 
-// 良い例: コメント削除
+// Good: remove comment
 existingUser := testutil.AddTestUser(...)
 assertUserSignupTokenFound(...)
 ```
 
-### 4. 変更履歴コメント
+### 4. Change History Comments
 
-`// removed`, `// deprecated`, `// added for issue X`, `// fixes https://example.com/org/repo/issues/123` 等の変更履歴は書かない。git log / PR 説明が SoT。
+Don't write change-history like `// removed`, `// deprecated`, `// added for issue X`, `// fixes https://example.com/org/repo/issues/123` etc. Git log / PR description is SoT.
 
-## 書く価値がある WHY の例
+## Examples of WHY Worth Writing
 
-識別子名や型シグネチャからは読み取れない情報のみ書く。
+Write only info not deducible from identifier names or type signatures.
 
-- 仕様外の制約: `// gorm.DeletedAt を持たない: 持つと暗黙的に soft delete に切り替わり hashed_password を含む行が残存する`
-- 一見冗長/非効率に見える処理の理由: `// constant-time compare で timing attack を防ぐ`
-- 他箇所と挙動が異なる正当な理由: `// この path だけ暗号化前に一度 hash する: legacy V1 のキー長制限 (32 bytes) に収めるため` ※「何をするか」だけでなく「なぜそうするか」まで書くこと。理由が書けないならそれは HOW であって WHY ではない
-- 既知バグ回避: `// https://example.com/issues/BUG-123: foo は nil を返すことがある`
+- Out-of-spec constraints: `// no gorm.DeletedAt: having it implicitly switches to soft delete and rows with hashed_password remain`
+- Reason for seemingly redundant/inefficient operation: `// constant-time compare prevents timing attack`
+- Valid reason for behavior differing elsewhere: `// only this path hashes once before encryption: fit legacy V1 key length limit (32 bytes)` — write not just "what to do" but "why." If you can't write the reason, it's HOW not WHY.
+- Known bug avoidance: `// https://example.com/issues/BUG-123: foo can return nil`
 
-## 言語別の注意
+## Language-Specific Notes
 
-### Go の exported 識別子
+### Go Exported Identifiers
 
-Go の golint 慣習で「exported 識別子には doc コメントを付ける」とされるが、**プロジェクト内の同ディレクトリ・同種ファイル（同じ Model / Repository / Interactor 等）に doc コメントが無いなら、自分も書かない**。慣習に従うかどうかはエコシステム単位ではなくプロジェクト単位で判定する。
+Go golint convention says "doc comments on exported identifiers," but **if same directory / same kind of file (same Model / Repository / Interactor etc.) in the project lacks doc comments, don't write them either**. Judge convention compliance per project, not per ecosystem.
 
-### Python docstring
+### Python Docstring
 
-ファイル内の既存関数に docstring が無いなら追加しない。一部の関数に docstring がある場合は、新規追加する関数にも docstring を付与してファイル内での一貫性を維持すること。
+If existing functions in the file lack docstring, don't add one. If some functions have docstring, add docstring to newly added functions to maintain file-level consistency.
 
-## 3 行以上のコメントブロックは要警戒
+## Three or More Line Comment Blocks: Caution
 
-WHY が 3 行必要なケースは稀。「3 行書きたい」と思った時点で、書こうとしているのが WHAT / 構造説明 / 対比であることが多い。一度疑って、削減できないか確認すること。
+WHY rarely requires 3 lines. If "I want to write 3 lines" crosses your mind, usually you're writing WHAT / structural explanation / contrast. Second-guess it and check if reduction is possible.
 
-3 行以上書きたくなったときは、削除を即決する前に以下の 2 段判定を必ず行う:
+Before deciding to delete, when wanting to write 3+ lines, always do this 2-stage check:
 
-1. **命名で吸収できないか**: コメントが説明している内容を識別子名（関数名・型名・引数名・enum タグ等）に埋め込めば消えないか。例: `ToEntities` が strict 変換であることをコメントで説明するより、`ToEntitiesStrict` / `ToEntitiesLenient` に分けて命名で意図を表すほうが SoT が 1 つになる
-2. **WHY だけに圧縮できないか**: WHAT / HOW を全部削った後に残る WHY が 1 行で書ければそれが正解。3 行残るならまだ削れていない
+1. **Can naming absorb it?**: Can you embed what the comment explains into identifier names (function names, type names, parameter names, enum tags etc.) so it disappears? Example: rather than comment explaining `ToEntities` is strict, name them `ToEntitiesStrict` / `ToEntitiesLenient` so naming states intent and SoT is one.
+2. **Can compress to WHY only?**: After deleting all WHAT / HOW, if remaining WHY fits one line, that's the answer. If 3 lines remain, not yet fully trimmed.
 
-## 判定タイミング
+## Judgment Timing
 
-「書く前」「書いた直後」「レビュー時」の 3 タイミングで判定する。ルールはあるが守られないのは判定タイミングが暗黙的なため。
+Judge at 3 timings: "before writing," "right after writing," "during review." Rules exist but go unobeyed because judgment timing is implicit.
 
-### 書く前
+### Before Writing
 
-新規にコメントを書こうとしたとき、本稿「書かない具体的パターン」のどれかに該当しないか確認する。該当するなら書かない。
+When about to write a comment, check it doesn't match any "Specific Patterns to Avoid" above. If it does, don't write.
 
-### 書いた直後（commit 前 sweep）
+### Right After Writing (pre-commit sweep)
 
-commit 前・PR 作成前は `/comment-sweep` skill で新規追加コメントを sweep する。skill が自分が追加したコメント行を抽出し本稿の判定を 1 行ずつ適用する (詳細は [.claude/skills/comment-sweep/SKILL.md](../.claude/skills/comment-sweep/SKILL.md) 参照)。
+Before commit / PR creation, use `/comment-sweep` skill to sweep newly added comments. Skill extracts comment lines you added and applies this document's judgment to each (see [.claude/skills/comment-sweep/SKILL.md](../.claude/skills/comment-sweep/SKILL.md) for details).
 
-### レビュー時（reviewer mode）
+### During Review (reviewer mode)
 
-PR / コード片のレビューを依頼されたとき、過剰コメントは **top-priority nit として明示的に flag** する。具体的には:
+When asked to review PR / code snippet, flag excessive comments as **top-priority nit explicitly**. Concretely:
 
-- 識別子名の言い換え・WHAT 説明・対比・変更履歴コメントは「削除推奨」として個別に指摘する
-- 3 行以上のコメントブロックは「命名で吸収できないか」を含めて代替案を提案する
-- ただし指摘の総数は **inline で最大 5 件まで**。それを超える場合は「他に N 件、同種の過剰コメントあり」と summary に集約し inline を膨らませない（reviewer noise を避けるための上限。Cloudflare の AI review 運用に倣う: https://blog.cloudflare.com/ai-code-review/ ）
-- 一方、本稿「書く価値がある WHY の例」に該当する既存コメントは flag しない。**reviewer mode では「コメントを増やすべき」方向の提案はしない** — 削減方向にのみ働く reviewer であること（「Python docstring」節の一貫性維持ルールは書き手側に適用される別ルールで、reviewer mode の対象外）
+- Rephrasing identifier names, WHAT explanations, contrasts, change-history comments: mark as "recommend deletion" with individual notes
+- 3+ line comment blocks: suggest alternatives including "can naming absorb this?"
+- But limit inline notes to **max 5**. Beyond that, aggregate in summary as "N more instances of this type of excessive comment" without bloating inline (reviewer noise limit per Cloudflare's AI review practice: https://blog.cloudflare.com/ai-code-review/)
+- However, don't flag existing comments matching "Examples of WHY Worth Writing" above. **In reviewer mode don't propose "should add comments"** — only work in reduction direction (the "Python docstring" section's consistency-maintenance rule applies to writers separately, outside reviewer mode scope)
 
-ユーザーから明示的に「コメント不要」「verbose にして」等の指示があった場合はそちらに従う。
+If user explicitly instructs "no comments needed" or "make verbose" etc., follow that.

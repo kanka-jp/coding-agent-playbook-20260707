@@ -1,26 +1,26 @@
-# cloud 常駐の無人 SRE 自動化（Bedrock）リファレンス
+# Cloud-resident unattended SRE automation (Bedrock) reference
 
-このディレクトリは、決定記録 [docs/decisions/cloud-unattended-sre.md](../../docs/decisions/cloud-unattended-sre.md) が定める
-**cloud 常駐（HOTU）パターン** — CloudWatch 5xx → agent → 自動 fix PR — の自己完結リファレンス。
+This directory is a self-contained reference for the
+**cloud-resident (HOTL) pattern** defined in the decision record [docs/decisions/cloud-unattended-sre.md](../../docs/decisions/cloud-unattended-sre.md)
+— CloudWatch 5xx → agent → automatic fix PR.
 
-手元で人間が read-only 調査する **local（HOTL）パターン**は [examples/observe](../observe/runbook.md) と
-[rules/box-personas.md](../../rules/box-personas.md) US3。両者は別軸で補完（local=人が深掘り / cloud=無人で一次対応）。
+The **local (HOTL) pattern** where humans conduct read-only investigation at hand is covered in [examples/observe](../observe/runbook.md) and
+[rules/box-personas.md](../../rules/box-personas.md) US3. These are complementary on different axes (local = human deep-dive / cloud = unattended first response).
 
-## 中身
+## Contents
 
-| path | 役割 |
+| path | Role |
 |---|---|
-| [spike/](spike/) | ADR の核心仮説「**Bedrock 上の agent が sanitized triage から妥当な fix を導けるか**」を、インフラを作らず最小コストで検証する harness。ADR を `Proposed → Accepted` に進めるためのゲート |
-| [pipeline/](pipeline/) | spike の上に乗る **trigger 配線 + identity 境界の設計**（CloudWatch 5xx → Lambda triage → fixer → PR）。観測/修正 2 つの least-privilege IAM 雛形と、dispatch を sanitize gate にする handoff 設計。IaC/実体は stage 系へ |
+| [spike/](spike/) | Harness that validates the ADR's core hypothesis: "**Can an agent on Bedrock derive appropriate fixes from sanitized triage?**" with minimal cost without building infrastructure. Gate for advancing ADR from `Proposed → Accepted` |
+| [pipeline/](pipeline/) | Built on top of spike: **trigger wiring + identity boundary design** (CloudWatch 5xx → Lambda triage → fixer → PR). Two least-privilege IAM templates for observation/remediation, handoff design that makes dispatch a sanitization gate. IaC/implementation belongs to stage branches |
 
-## 段階
+## Phases
 
-ADR の「残差・未決」に沿った構築順:
+Build order following ADR's "residual / undecided" items:
 
-1. **spike**（[spike/](spike/)）— 核心仮説の検証。← 通過済み（直 Anthropic key で初回 PASS）
-2. **trigger 配線 + identity 設計**（[pipeline/](pipeline/)）— CloudWatch 5XX alarm → SNS → Lambda triage、観測/修正 identity の IAM 境界。← いまここ（設計）
-3. パターン A（Fargate / CodeBuild で `claude -p`）→ B（AgentCore Runtime で Agent SDK）を end-to-end
-4. 教材化（`stage/06→07` を pipeline 実演に + `slides/` の運用保守フェーズ）
+1. **spike** ([spike/](spike/)) — Validation of core hypothesis. ← Completed (first PASS with direct Anthropic key)
+2. **trigger wiring + identity design** ([pipeline/](pipeline/)) — CloudWatch 5XX alarm → SNS → Lambda triage, IAM boundary for observation/remediation identities. ← Current phase (design)
+3. Pattern A (Fargate / CodeBuild with `claude -p`) → B (AgentCore Runtime with Agent SDK) end-to-end
+4. Course material (stage 06→07 demonstration of pipeline + operations/maintenance phase in `slides/`)
 
-2 以降のパイプライン実体と仕込みバグは demo アプリ（stage 系）側に置く。本ディレクトリは main 側の
-横断リファレンス（認証/実行基盤・検証 harness）に徹する（[CLAUDE.md](../../CLAUDE.md)「stage ブランチの規約」）。
+Pipeline implementation from phase 2 onwards and seeded bugs are placed in demo app (stage branches). This directory is confined to being a cross-cutting reference (auth/execution foundation, validation harness) on main ([CLAUDE.md](../../CLAUDE.md) "Stage branch conventions").

@@ -1,74 +1,74 @@
-# Setup 詳細
+# Setup Details
 
-[README](../README.md) §1 の Quick start で扱わない補足。秘密情報の権限根拠、cdx-`<NAME>` pair reviewer の運用、image / claude / codex の更新手順。
+Supplements not covered in [README](../README.md) §1 Quick start. Credentials permissions rationale, cdx-`<NAME>` pair reviewer operations, image / claude / codex update procedures.
 
-## 認証 secret の詳細
+## Authentication Secrets Details
 
-box 起動時に sbx が自動で box に provision するため、毎回 `/login` / GitHub 認証する必要なし。**secret はグローバルでも box の作成時にのみ provision される**ため、`scripts/dev.sh` で box を立てる前に下記 3 つの secret (anthropic / github / openai) を登録しておく必要がある (後から登録すると box を再作成しないと反映されない)。**API key 経路 / 箱内 /login 経路 / codex サブスク (`~/.codex/auth.json` 転送) 経路の使い分け** は [sbx/README.md](../sbx/README.md) 「認証」セクション参照。
+sbx auto-provisions to box on launch, so no need to `/login` / authenticate GitHub each time. **Even global secrets only provision at box creation**, so register the 3 secrets below (anthropic / github / openai) before launching box with `scripts/dev.sh` (registering later requires box recreation to take effect). For using **API key route / `/login` inside box route / codex subscription (`~/.codex/auth.json` transfer) route**, see [sbx/README.md](../sbx/README.md) "Authentication" section.
 
-### anthropic (claude を box の中で動かす)
+### anthropic (run claude inside box)
 
 ```bash
-claude setup-token                         # 長期トークン sk-ant-oat01-... を発行 (host で 1 回)
-sbx secret set -g anthropic                # 表示されたトークンを貼る
+claude setup-token                         # Issue long-lived token sk-ant-oat01-... (once on host)
+sbx secret set -g anthropic                # Paste displayed token
 ```
 
-長期トークンを発行せず API key 経路で済ませたい場合は、`claude setup-token` の代わりに [sbx/README.md 経路 A](../sbx/README.md#経路-a-api-keyproxy-注入トークンは-box-に入らない) (`sbx secret set -g anthropic` に API key を貼る) に置き換える。この場合 `claude` CLI の host install は省略可。
+To avoid issuing long-lived token and just use API key route, replace `claude setup-token` with [sbx/README.md route A](../sbx/README.md#route-a-api-key-proxy-injection-token-stays-off-box) (paste API key to `sbx secret set -g anthropic`). In this case, skip host `claude` CLI install.
 
-### github (PR 操作)
+### github (PR operations)
 
-[README](../README.md) §3 の PR フローで box の中の `gh pr create` / `gh pr checks` / `gh run view` が叩く。**fine-grained PAT** ([https://github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new)) を発行する:
+In PR flow [README](../README.md) §3, box runs `gh pr create` / `gh pr checks` / `gh run view`. Issue **fine-grained PAT** ([https://github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new)):
 
-- **Repository access**: 本リポ (fork なら自分のコピー) のみに限定
+- **Repository access**: limit to this repo only (own copy if fork)
 - **Permissions** (Repository permissions):
-  - Contents: Read and write — `gh pr create` / `git push` 用
-  - Pull requests: Read and write — `gh pr create` / `gh pr edit` / `gh pr comment` / `gh pr merge` 用
-  - Issues: Read and write — レビュー由来の backlog を box 内から `gh issue create` で起票する用（無いと `Resource not accessible by personal access token (createIssue)` で失敗する）
-  - Actions: Read-only — `gh pr checks` の statusCheckRollup / `gh run view --log` の CI 失敗診断用
-  - Commit statuses: Read-only — legacy status check API (`gh pr checks` が併用)
-  - (Metadata: Read-only は自動付与)
-- **Expiration**: 90 日程度を推奨 (期限切れたら再発行 + 再登録)
+  - Contents: Read and write — for `gh pr create` / `git push`
+  - Pull requests: Read and write — for `gh pr create` / `gh pr edit` / `gh pr comment` / `gh pr merge`
+  - Issues: Read and write — for filing review-derived backlog from box with `gh issue create` (missing causes `Resource not accessible by personal access token (createIssue)` failure)
+  - Actions: Read-only — for `gh pr checks` statusCheckRollup / `gh run view --log` CI failure diagnosis
+  - Commit statuses: Read-only — legacy status check API (used alongside `gh pr checks`)
+  - (Metadata: Read-only auto-granted)
+- **Expiration**: recommend ~90 days (reissue + re-register when expired)
 
-発行された PAT (`github_pat_...`) を `sbx secret` に貼る:
+Paste issued PAT (`github_pat_...`) to `sbx secret`:
 
 ```bash
-sbx secret set -g github                   # 表示されたプロンプトに PAT を貼る
+sbx secret set -g github                   # Paste PAT to displayed prompt
 ```
 
-> ℹ️ **fine-grained PAT を選ぶ理由**: classic PAT や `gh auth login` 由来の OAuth token はアカウント全体の repo に対する scope を持つため、box 内 (YOLO 実行) で乗っ取られると blast radius が大きい。fine-grained PAT は対象 repo + 必要権限のみに絞れるため、box から抜けた攻撃者が触れる範囲を構造的に最小化できる ([Docker Sandboxes 公式ガイダンス](https://docs.docker.com/ai/sandboxes/security/credentials/) の最小権限原則と同型)。期限を切ることで漏洩時の有効期間も bound できる。
+> ℹ️ **Why choose fine-grained PAT**: classic PAT or OAuth token from `gh auth login` have scope over all repos for the account, so if compromised in box (YOLO execution), blast radius is large. Fine-grained PAT scopes to target repo + needed permissions only, structurally minimizing attacker's reachable scope after exiting box ([Docker Sandboxes official guidance](https://docs.docker.com/ai/sandboxes/security/credentials/) is the same least-privilege principle). Setting expiration also bounds valid period on leak.
 
 ### openai (codex review = /a2a-review / /pr-codex-ci)
 
 ```bash
-sbx secret set -g openai --oauth           # browser で ChatGPT 認証 (codex CLI と同じフロー、サブスク経路推奨)
+sbx secret set -g openai --oauth           # Authenticate ChatGPT in browser (same flow as codex CLI, subscription route recommended)
 ```
 
-## cdx-`<NAME>` pair reviewer の運用 (per-pair lifecycle)
+## cdx-`<NAME>` pair reviewer operations (per-pair lifecycle)
 
-codex second-opinion (`/a2a-review` / `/pr-codex-ci`、[README](../README.md) §3 の PR フロー step 4) は **claude box `<NAME>` とペアの codex box `cdx-<NAME>`** に立てた A2A server に instruction を投げる構成。
+Codex second-opinion (`/a2a-review` / `/pr-codex-ci`, [README](../README.md) §3 PR flow step 4) throws instructions to A2A server on codex box `cdx-<NAME>` paired with claude box `<NAME>`.
 
 **per-pair lifecycle**:
 
-- **起動**: `bash scripts/dev.sh` (引数なし、自動命名) または `bash scripts/dev.sh <NAME>` (明示名、bind-mount path) を叩くと dev.sh が auto で `cdx-<NAME>` を pair-setup し、`pair-serve` (server 起動 + host port を kernel ephemeral で publish + claude box の egress 許可 + lease file 書き込み) を子プロセスとして bg fork する (初回 ~30s、以降は box 再利用で速い)。
-- **使用中**: claude box の env に `$A2A_CODEX_URL=http://host.docker.internal:<port>` が注入され、`/a2a-review` (= `bash scripts/internal/a2a-review.sh ask`) が透過的に reach する。並列で別 `<NAME>` を起動しても各 pair が独立 port を持ち干渉しない (debate 2026-06-27 で確定した per-pair 設計、port は dynamic ephemeral)。
-- **終了**: claude box の TTY を抜けると `sbx run` が return し、dev.sh の trap で `pair-teardown` (server 停止 + `cdx-<NAME>` box 削除 + lease 削除) が走る。orphan reviewer box が残らない。明示停止は `bash scripts/dev.sh kill <NAME|N>`。
+- **Launch**: Running `bash scripts/dev.sh` (no args, auto-named) or `bash scripts/dev.sh <NAME>` (explicit name, bind-mount path) makes dev.sh auto pair-setup `cdx-<NAME>` and bg-fork `pair-serve` (server start + publish host port kernel ephemeral + allow claude box egress + write lease file) as child process (~30s first time, fast on box reuse after).
+- **In use**: Claude box env gets `$A2A_CODEX_URL=http://host.docker.internal:<port>` injected, `/a2a-review` (= `bash scripts/internal/a2a-review.sh ask`) reaches transparently. Starting separate `<NAME>` in parallel, each pair gets independent port, no interference (per-pair design confirmed debate 2026-06-27, port is dynamic ephemeral).
+- **Shutdown**: Exiting claude box TTY returns `sbx run`, dev.sh trap runs `pair-teardown` (stop server + delete `cdx-<NAME>` box + delete lease). No orphan reviewer boxes remain. Explicit stop: `bash scripts/dev.sh kill <NAME|N>`.
 
-手動で reviewer box を立てる必要はない (上記 lifecycle 通り auto)。Host で常駐 daemon / launchd / systemd を入れない方針 (workshop premise: clone するだけで揃う、PR #68/#70 で revert 済みの方向と整合)。
+No need to manually launch reviewer box (auto per lifecycle above). Policy: no resident daemon / launchd / systemd on host (workshop premise: clone alone suffices, direction consistent with PR #68/#70 reverts).
 
-> ⚠️ **openai secret を rotate / 更新した場合は既存 `cdx-<NAME>` box を破棄する必要がある**: secret は box 作成時に provision される設計のため、rotate 後の既存 box は古い credential のまま固定される (`/a2a-review` が後で fail する原因)。`bash scripts/dev.sh <NAME>` を抜けて `cdx-<NAME>` が auto-teardown されれば、次回起動で新 secret で auto-provision される。手動破棄: `sbx rm -f cdx-<NAME>` (または `bash scripts/dev.sh kill <NAME>`)。
+> ⚠️ **If you rotate / update openai secret, must destroy existing `cdx-<NAME>` boxes**: design provisions secret at box creation, so existing boxes post-rotation stay locked to old credentials (causes `/a2a-review` to fail later). Exiting `bash scripts/dev.sh <NAME>` auto-tears down `cdx-<NAME>`, next launch auto-provisions with new secret. Manual destroy: `sbx rm -f cdx-<NAME>` (or `bash scripts/dev.sh kill <NAME>`).
 >
-> ⚠️ **sandbox box (`bash scripts/dev.sh sandbox`) では pair reviewer が無い**: sandbox は `--clone .` で起動し host checkout を mount しないため codex から claude の編集が見えず、`/a2a-review` / `/pr-codex-ci` は使えない。reviewer が要るときは dev box (`bash scripts/dev.sh`) を使う ([parallel.md](parallel.md))。
+> ⚠️ **Sandbox box (`bash scripts/dev.sh sandbox`) has no pair reviewer**: sandbox starts with `--clone .` not mounting host checkout, so codex can't see claude's edits, `/a2a-review` / `/pr-codex-ci` unavailable. Use dev box (`bash scripts/dev.sh`) when reviewer needed ([parallel.md](parallel.md)).
 
-## image / claude / codex の更新 (たまに)
+## Image / claude / codex updates (occasionally)
 
 macOS / Linux / Git Bash (Windows):
 
 ```bash
-bash scripts/build-image.sh                # image rebuild + sbx template 再 load (1 行)
-bash scripts/dev.sh ls                     # 旧 image で立てた dev box の一覧
-bash scripts/dev.sh kill <NAME|N>          # 旧 dev box を破棄 (cdx-<NAME> pair も同時破棄、state は失われる)
-bash scripts/dev.sh                        # 新 image で再作成 (引数なし = 自動命名 dev box)
-# sandbox box (clone) は dev.sh ls に出ない。残っている場合は `sbx ls` で確認して `sbx rm <生成名>` で別途整理
+bash scripts/build-image.sh                # Image rebuild + sbx template reload (1 line)
+bash scripts/dev.sh ls                     # List dev boxes created with old image
+bash scripts/dev.sh kill <NAME|N>          # Destroy old dev box (cdx-<NAME> pair also destroyed, state lost)
+bash scripts/dev.sh                        # Recreate with new image (no args = auto-named dev box)
+# Sandbox boxes (clone) don't show in dev.sh ls. If remaining, confirm with `sbx ls` and cleanup separately with `sbx rm <generated-name>`
 ```
 
 Windows (PowerShell):
@@ -81,4 +81,4 @@ powershell -ExecutionPolicy Bypass -File scripts/dev.ps1
 # Optional cleanup of ad-hoc sandbox boxes: sbx ls; sbx rm <generated name>
 ```
 
-`scripts/build-image.sh` は `AGENT_CACHEBUST` で installer layer の cache を破棄し、上流の apt / Chromium は cache 再利用 (重い layer を毎回 download しない)。
+`scripts/build-image.sh` discards installer layer cache with `AGENT_CACHEBUST`, reusing upstream apt / Chromium cache (avoids re-downloading heavy layers).

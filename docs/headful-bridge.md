@@ -1,116 +1,116 @@
-# headful CDP bridge（box から host の見える Chrome を操作する）
+# headful CDP bridge (operate host's visible Chrome from box)
 
-box の中の claude（chrome-devtools MCP）から、**host の見える Chrome** を CDP で操作するための opt-in ブリッジ。session を box に維持したまま、独立した可視ブラウザを agent に運転させたいとき用。
+Opt-in bridge for claude inside box (chrome-devtools MCP) to operate **host's visible Chrome** via CDP. Use when keeping session in box but wanting agent to drive an independent visible browser.
 
-通常の box session では chrome-devtools MCP は **box 内の headless Chromium** を動かす（`.mcp.json` の `CDP_HEADLESS` 切替）。本ブリッジはそれと別に、**host 側の headful Chrome** に橋渡しする。
+Normally, box sessions run chrome-devtools MCP on **box's headless Chromium** (controlled by `CDP_HEADLESS` in `.mcp.json`). This bridge bridges separately to **host's headful Chrome**.
 
-## いつ使うか / 使わないか
+## When to use / not use
 
-- 使う: 「host 画面に見えるブラウザを agent に操作させたい」「人がブラウザの様子を見ながら HOTL したい」
-- 使わない: スクショ確認や DOM 取得だけなら **box の headless（既定）** で十分。ブリッジは攻撃面を増やすので必要時のみ。
+- **Use**: "Want agent to drive visible browser on host screen" / "Want to HOTL while watching browser"
+- **Don't use**: Screenshots/DOM-only work use **box headless (default)** fine. Bridge increases attack surface, use only when needed.
 
-## ⚠️ セキュリティ（必読）
+## ⚠️ Security (must read)
 
-CDP は**そのブラウザの全権**を与える: 任意ページへ navigate / DOM 読取 / **任意 JS 実行** / **cookie・localStorage・ログイン session の読取** / ダウンロード。
+CDP gives **full browser control**: arbitrary navigate / DOM read / **arbitrary JS execution** / **cookie/localStorage/login session read** / download.
 
-> **最大の危険**: 実 Chrome プロファイルに繋ぐと、box（microVM 隔離）の agent が Gmail / GitHub / AWS 等の**ログイン済み session を実質乗っ取れる**。box-primary の隔離前提が壊れる。
+> **Biggest risk**: Connecting to real Chrome profile, box (microVM-isolated) agent can **effectively hijack logged-in sessions** on Gmail/GitHub/AWS etc. Breaks box-primary isolation premise.
 
-本ブリッジはこれを設計で防ぐ:
+This bridge prevents it by design:
 
-| 対策 | 内容 |
-|---|---|
-| **使い捨て profile（既定）** | host 側は既定で実 profile と別の throwaway `--user-data-dir` を `up` ごとに作り `down` で消す。既知の実ブラウザ profile root（Chrome / Beta / Canary / Chromium / Edge / Brave、symlink も解決して比較）を指す指定は**拒否**する。ただしこの guard は safety net で網羅は不可能なため、`CDP_PROFILE_DIR` を**明示する場合は実 profile を渡さない責任が user 側にある**（明示 dir は auto 削除もされない）。使い捨て profile は creds の無い空ブラウザだが、**box headless と「同等」ではない**（下の注意を参照） |
-| **port preflight** | `up` 時に `localhost:<port>` が**既に CDP を喋っていたら中止**する。別プロセス（実 profile の Chrome かも）が port を占有している状態で policy allow すると、使い捨てでない既存ブラウザを box に晒すため |
-| **loopback 限定** | host Chrome は `127.0.0.1`、box relay も `127.0.0.1` bind。LAN 露出なし |
-| **box scope（任意）** | `CDP_BOX=<box名>` を指定すると egress を `--sandbox` でその box だけに絞る。未指定だと host 上の全 box が relay を張れるため、複数 box を回す時は指定推奨 |
-| **tight な policy allow** | `localhost:<port>` のみ許可（`**` ではない） |
-| **opt-in / ephemeral** | 既定無効。`up` した時だけ起動、`down` で Chrome 停止 + relay 停止 + **egress rule 削除**まで戻す |
-| **committed 設定を汚さない** | `.mcp.json` は変更しない。MCP 接続は `claude mcp add-json`（local scope）で opt-in |
+| Measure | Details |
+|---------|---------|
+| **Disposable profile (default)** | Host creates throwaway `--user-data-dir` separate from real profile per `up`, deletes on `down`. Rejects specs pointing to known real profile roots (Chrome/Beta/Canary/Chromium/Edge/Brave, resolves symlinks). Safety net only—can't cover all—so **if `CDP_PROFILE_DIR` explicit, user responsible not to pass real profile** (explicit dir not auto-deleted). Throwaway has no creds, but **not "equivalent" to box headless** (see warning below) |
+| **Port preflight** | On `up`, **stops if `localhost:<port>` already speaks CDP**. Prevents exposing non-throwaway existing browser if another process (maybe real Chrome) occupies port when policy allows |
+| **Loopback only** | Host Chrome on `127.0.0.1`, box relay also binds `127.0.0.1`. No LAN exposure |
+| **Box scope (optional)** | Set `CDP_BOX=<box-name>` to constrain egress `--sandbox` to that box only. Unset: all boxes on host can relay, so specify when running multiple boxes |
+| **Tight policy allow** | Only `localhost:<port>` permitted (not `**`) |
+| **Opt-in / ephemeral** | Default off. On `up` launch, on `down` stop Chrome + relay + **delete egress rule** |
+| **Don't dirty committed config** | Don't modify `.mcp.json`. MCP connection via `claude mcp add-json` (local scope) opt-in |
 
-> **⚠️ box headless と「同等リスク」ではない**: 使い捨て profile でも、CDP は **host 上で動く実ブラウザ**を操作する。agent はそのブラウザを `http://localhost:<host のサービス>` や `file://...` に navigate させ、レンダリング結果を CDP で読み取れる。これは box の egress policy（CONNECT トンネルしか gate しない）を**迂回して host ローカルの管理サービス・dev server・ローカルファイルに到達**しうる。box の headless Chromium は microVM 内に隔離されているのでこの経路は無い。host 側に機微なローカルサービスがある環境では、必要時のみ `up` し用が済んだら即 `down` すること。
+> **⚠️ Not "equivalent risk" to box headless**: Even throwaway profile, CDP operates **real browser running on host**. Agent can navigate to `http://localhost:<host-service>` or `file://...`, read rendering via CDP. This **bypasses box egress policy (only gates CONNECT tunnels)** to reach host local admin services / dev servers / local files. Box's headless Chromium is microVM-isolated so this path doesn't exist. In environments with sensitive local services on host, `up` only when needed, `down` immediately after use.
 
-**運用ルール**: ブリッジした Chrome は「agent のブラウザ」とみなし、**実アカウントでログインしない**こと。終わったら必ず `down`。
+**Operations rule**: Bridge's Chrome is "agent's browser"—**don't log real accounts**. Always `down` when done.
 
-## アーキテクチャ（なぜ relay が要るか）
+## Architecture (why relay is needed)
 
-この sbx 環境では box→host の直リンクローカル（`169.254.1.1` / `fe80::1`）は gateway appliance 止まりで **host のサービスに届かない**。box→host は **sbx proxy（`gateway.docker.internal:3128`）経由が唯一の正路**で、`sbx policy allow` で gate される。
+In this sbx environment, box→host direct link-local (`169.254.1.1` / `fe80::1`) stops at gateway appliance and **doesn't reach host services**. Box→host **via sbx proxy (`gateway.docker.internal:3128`) is the only valid path**, gated by `sbx policy allow`.
 
-一方 puppeteer（chrome-devtools-mcp の中身）は `HTTP_PROXY` を自動では使わない。そこで **box 内に socat 中継**を置き、puppeteer は box localhost（NO_PROXY → 直結）に繋ぎ、socat が proxy の **HTTP CONNECT** で host Chrome までトンネルする:
+Puppeteer (the chrome-devtools-mcp internals) doesn't auto-use `HTTP_PROXY`. So **place socat relay inside box**; puppeteer connects to box localhost (NO_PROXY → direct), socat tunnels via proxy's **HTTP CONNECT** to host Chrome:
 
 ```text
 [box] chrome-devtools-mcp --browser-url http://localhost:9333
-        |  (NO_PROXY: box localhost 直結)
+        |  (NO_PROXY: box localhost direct)
         v
 [box] socat TCP-LISTEN:9333 -> PROXY(CONNECT) gateway.docker.internal:3128
         |  (sbx policy allow network localhost:9222)
         v
-[host] Chrome --remote-debugging-port=9222  (使い捨て profile / loopback / 見える)
+[host] Chrome --remote-debugging-port=9222  (disposable profile / loopback / visible)
 ```
 
-HTTP（`/json/*`）も WebSocket upgrade も CDP コマンドも、この経路で通ることを実測済み。Chrome は Host ヘッダを `webSocketDebuggerUrl` に反映するので、`localhost:<relay>` で叩けば自己整合し、Host 書き換えや IP リテラル細工は不要。
+Verified in practice: HTTP (`/json/*`), WebSocket upgrade, and CDP commands all transit this path. Chrome reflects Host header in `webSocketDebuggerUrl`, so hitting `localhost:<relay>` self-aligns; no Host rewriting or IP literal tricks needed.
 
-## 手順（推奨: host で一発）
+## Procedure (recommended: one-liner on host)
 
-`--box <box名>` を渡すと、host `up` が **port 自動選択 → 使い捨て Chrome 起動 → egress 許可 → `sbx exec` で box relay 起動 → MCP 登録** まで 1 コマンドで行う。
+Passing `--box <box-name>` makes host `up` perform **auto-select port → launch disposable Chrome → permit egress → launch box relay via `sbx exec` → register MCP** in one command.
 
 ```bash
-# host 側 (box 名は box 内 `echo $SANDBOX_VM_ID` で確認)
-bash scripts/cdp-bridge.sh up --box <box名>
-# Windows: pwsh scripts/cdp-bridge.ps1 up -Box <box名>
+# host side (confirm box name via box's `echo $SANDBOX_VM_ID`)
+bash scripts/cdp-bridge.sh up --box <box-name>
+# Windows: pwsh scripts/cdp-bridge.ps1 up -Box <box-name>
 ```
 
-- **port 自動選択**: `--port` 未指定なら既定 9222 が埋まっていても空き port を自動で選ぶ（占有 port には触れない＝実 profile の Chrome を晒さない安全性は不変）。固定したいときは `--port 9223`。
-- **box relay 自動起動**: `sbx exec <box> bash scripts/cdp-bridge.sh up ...` で box 側 relay を立てる。`--no-connect` で抑止し手動運用に戻せる。
+- **Auto-select port**: Without `--port` specified, auto-finds empty port even if default 9222 is taken (doesn't touch occupied ports = safety preserves no real profile exposure). Fix with `--port 9223` if desired.
+- **Auto-launch box relay**: `sbx exec <box> bash scripts/cdp-bridge.sh up ...` starts box relay. Suppress with `--no-connect` and revert to manual operation.
 
-### agent 側の接続（重要な前提）
+### Agent-side connection (critical prerequisite)
 
-MCP サーバーは **Claude Code のセッション起動時にしか load されない**（[hot-reload 不可](https://github.com/anthropics/claude-code/issues/46426)）。よって:
+MCP server **loads only at Claude Code session startup** ([no hot-reload](https://github.com/anthropics/claude-code/issues/46426)). Thus:
 
-- **現行 box セッション**（既に動いている claude）: MCP には反映されない。relay を直接叩いて操作する（`http://localhost:<relay>` の CDP HTTP/WS。例: `curl -X PUT "http://localhost:9333/json/new?<url>"` で navigate）。
-- **次に起動する box セッション**: `up --box` が登録した `chrome-devtools-host` MCP が最初から使える（box headless の `chrome-devtools` と並存）。
+- **Existing box session** (claude already running): MCP unchanged. Directly hit relay for operations (`http://localhost:<relay>` CDP HTTP/WS. Example: `curl -X PUT "http://localhost:9333/json/new?<url>"` to navigate).
+- **Next box session launch**: `up --box` registers `chrome-devtools-host` MCP available from start (coexists with box headless's `chrome-devtools`).
 
-### 手動（`--box` を使わない / 細かく制御したいとき）
+### Manual (without `--box` / fine-grained control)
 
 ```bash
-# 1) host: Chrome 起動 + egress 許可（box relay は張らない）
+# 1) host: launch Chrome + permit egress (don't start box relay)
 bash scripts/cdp-bridge.sh up --no-connect --port 9223
-# 2) box: relay 起動（host が選んだ port を渡す）
+# 2) box: launch relay (pass port host selected)
 bash scripts/cdp-bridge.sh up --port 9223
-# 3) (新セッション用) MCP 登録
+# 3) (for new session) register MCP
 claude mcp add-json chrome-devtools-host \
   '{"command":"npx","args":["chrome-devtools-mcp@latest","--browser-url","http://localhost:9333"]}'
 ```
 
-### 片付け（必須）
+### Cleanup (mandatory)
 
 ```bash
-# host: Chrome 停止 + egress rule 削除 + 使い捨て profile 削除 (+ --box/scope があれば box relay も停止)
+# host: stop Chrome + remove egress rule + delete disposable profile (+ if --box/scope, also stop box relay)
 bash scripts/cdp-bridge.sh down
 # Windows host: pwsh scripts/cdp-bridge.ps1 down
-# MCP を登録した場合: claude mcp remove chrome-devtools-host
+# If MCP was registered: claude mcp remove chrome-devtools-host
 ```
 
-`up --box` で張った場合、host `down` は up 時に保存した box scope から box relay も `sbx exec ... down` で畳む。box 単独で畳むなら box 内 `bash scripts/cdp-bridge.sh down`。
+When launched via `up --box`, host `down` also folds box relay via `sbx exec ... down` using box scope saved at `up` time. To fold box alone, in box: `bash scripts/cdp-bridge.sh down`.
 
-## options / env
+## Options / Env
 
-各オプションは flag（`--port` 等、Windows は `-Port` 等）でも env でも指定でき、**flag > env > 既定**の優先順。
+Each option specifiable as flag (`--port` etc; Windows `-Port` etc) or env, priority **flag > env > default**.
 
-| flag | env | 既定 | 用途 |
+| flag | env | default | purpose |
 |---|---|---|---|
-| `--port N` | `CDP_PORT` | `9222`（未指定時は host `up` が空き port を自動選択） | host Chrome の remote-debugging port。明示時は占有なら abort、非明示時は空きを自動 scan |
-| `--relay-port N` | `CDP_RELAY_PORT` | `9333` | box relay の listen port |
-| `--profile-dir DIR` | `CDP_PROFILE_DIR` | 未指定時は `up` ごとに `mktemp` で作成し `down` で削除 | 使い捨て profile dir。明示時は `down` の auto 削除対象外（user 所有扱い）。既知の実 profile root は guard が拒否するが網羅ではないため、明示する場合は実 profile を渡さないこと |
-| `--box NAME` | `CDP_BOX` | 未指定（全 box 許可・relay 手動） | host `up` で (a) egress を `--sandbox <box名>` でその box だけに絞り、(b) `sbx exec` で box relay まで自動起動する |
-| `--no-connect` | — | off | host `up` で box relay の自動起動を抑止（Chrome + egress だけ張る） |
+| `--port N` | `CDP_PORT` | `9222` (unless unspecified, auto-selects empty port) | host Chrome remote-debugging port. If explicit and occupied, abort; if unspecified, auto-scan for empty |
+| `--relay-port N` | `CDP_RELAY_PORT` | `9333` | box relay listen port |
+| `--profile-dir DIR` | `CDP_PROFILE_DIR` | unspecified: per `up`, `mktemp` creates, `down` deletes | disposable profile dir. If explicit, not auto-deleted on `down` (user-owned). Guard rejects known real profile roots but not exhaustive; if explicit, don't pass real profile |
+| `--box NAME` | `CDP_BOX` | unspecified (all boxes allowed, relay manual) | at host `up`, (a) narrow egress via `--sandbox <box-name>` to that box only, (b) auto-launch box relay via `sbx exec` |
+| `--no-connect` | — | off | suppress auto-launch of box relay on host `up` (Chrome + egress only) |
 
-## トラブルシューティング
+## Troubleshooting
 
-| 症状 | 対処 |
+| Symptom | Resolution |
 |---|---|
-| box `status` が `no` | host で `up` 済みか / `sbx policy ls` に `localhost:<選択された port>` allow があるか確認（port は host `status` で表示。auto 選択時は 9222 とは限らない） |
-| `relay 起動。ただし host Chrome 未到達` | host Chrome が落ちている or policy 未許可。host `status` で確認 |
-| `CDP_PROFILE_DIR が実ブラウザ profile を指しています` | 安全 guard。別 dir を指定（既定のまま推奨） |
-| `localhost:<port> で既に別プロセスが CDP を listen しています` | `--port` を**明示**したのにその port が占有されている時だけ出る（明示意図を尊重して abort）。閉じるか別 `--port` を指定。`--port` 非明示なら自動で空き port に逃げるのでこのエラーは出ない |
-| egress rule が残る | `sbx policy ls` で `localhost:<選択された port>` を探して削除（`down` が自動削除を試みる。port は host `status` で確認） |
-| Windows host で `socat` が無い | relay（box 側）は Linux box 内で bash 実行が前提。host 側 `up/down` のみ PowerShell で使う |
+| box `status` is `no` | verify host `up` ran / check `sbx policy ls` for `localhost:<selected-port>` allow (port shown in host `status`; auto-select doesn't guarantee 9222) |
+| `relay started. host Chrome unreachable` | host Chrome down or policy not permitted. Check host `status` |
+| `CDP_PROFILE_DIR points to real browser profile` | safety guard. Specify different dir (keep default recommended) |
+| `localhost:<port> already has another process listening for CDP` | only appears if `--port` **explicitly set** and that port occupied (respect explicit intent, abort). Close it or specify different `--port`. Without explicit `--port`, auto-escapes to empty port so error doesn't appear |
+| egress rule persists | find `localhost:<selected-port>` in `sbx policy ls` and delete (`down` attempts auto-delete. Confirm port via host `status`) |
+| Windows host lacks `socat` | relay (box side) assumes bash inside Linux box. Use PowerShell for host-side `up/down` only |

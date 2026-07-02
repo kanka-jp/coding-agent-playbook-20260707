@@ -1,53 +1,53 @@
-# 決定記録: decomposed multi-agent（1 agent 1 box + native auth + A2A coordination）
+# Decision Record: decomposed multi-agent (1 agent 1 box + native auth + A2A coordination)
 
-**ステータス: Accepted（2026-06-19、実装は staged）** — 下記「検証ゲート (spike)」を実機で通過。[parallel-hotl-execution.md](parallel-hotl-execution.md) で採用した sbx microVM 基盤の上に、複数 agent を **「1 box 1 agent」に分解し A2A で協調させる**方向を決定する。若い spec + 非自明ビルドのため実装は Stage 1〜3 に分けて段階導入する。**本 ADR は execution topology（box 内 agent 配置）を evolve するもので、[parallel-hotl-execution.md](parallel-hotl-execution.md) の sbx 採用は不変。**現行の co-located（claude+codex 同居）モデルは Stage 1 が landing するまで current implementation として有効で、本 ADR の決定は target end-state を定義する。
+**Status: Accepted (2026-06-19, implementation is staged)** — Passed verification gate (spike) on real hardware. On top of the sbx microVM platform adopted in [parallel-hotl-execution.md](parallel-hotl-execution.md), decided to **decompose multiple agents into "1 box 1 agent" and coordinate via A2A**. Due to young spec + non-trivial build, implementation rolls out in stages 1-3. **This ADR evolves execution topology (agent placement in box); sbx adoption from [parallel-hotl-execution.md](parallel-hotl-execution.md) is unchanged.** The current co-located (Claude+Codex co-resident) model remains valid as current implementation until Stage 1 lands; this ADR's decision defines target end-state.
 
-## 背景
+## Background
 
-[parallel-hotl-execution.md](parallel-hotl-execution.md) は sbx を実行基盤に採用し、現行は **built-in claude agent の 1 box に claude+codex を同居**させ、claude が codex を shell out して相互レビューする構成（[../../sbx/README.md](../../sbx/README.md)）。これは「並列 HOTL を安全に」までは満たすが、次で詰まる:
+[parallel-hotl-execution.md](parallel-hotl-execution.md) adopted sbx as the execution platform. Currently **Claude+Codex reside in one box as built-in Claude agent**, with Claude shell out to Codex for mutual review (see [../../sbx/README.md](../../sbx/README.md)). This satisfies "safely parallel HOTL" but hits a wall on:
 
-- **拡張性**: gemini / grok 等の agent や、agent でない service（DB・検索・tool）を後から足すのが、1 box 同居モデルでは綺麗に伸びない。
-- **codex 認証の摩擦**: 同居 box では codex のサブスク OAuth が proxy 注入されない（agent-gating: 注入は built-in agent 限定）。そのため `~/.codex/auth.json` を box ごとに host から転送する必要があり、複数 box 並列では refresh token rotation で 401 のリスクが残る（[../../sbx/README.md](../../sbx/README.md) のセキュリティ注記参照）。
+- **Extensibility**: Adding agents like Gemini / Grok or non-agent services (DB, search, tools) does not scale cleanly in a 1-box co-resident model.
+- **Codex auth friction**: In a co-resident box, Codex subscription OAuth is not proxy-injected (agent-gating: injection is built-in agent only). This requires transferring `~/.codex/auth.json` from host to each box; in parallel multi-box scenarios, refresh token rotation leaves 401 risk (see security note in [../../sbx/README.md](../../sbx/README.md)).
 
-オーナーの目的更新: **受講者が gemini/grok や非 agent サービスを後から足せる、拡張可能な multi-agent 開発アーキを教材として示す**こと。
+Owner's updated goal: **Show trainees an extensible multi-agent development architecture where they can add Gemini/Grok or non-agent services later**.
 
-## 判断軸: 拡張性は「関心の分解」を要求する
+## Decision axis: Extensibility requires "separation of concerns"
 
-「agent / service を足す」を宣言的にしたいなら、**1 box 1 concern（microservices 哲学）+ 標準プロトコルで協調**が筋。業界も **A2A（agent ↔ agent）+ MCP（agent → tool）** に収斂しており、拡張が「Agent Card を publish / MCP server を登録」に落ちる。同居モノリスはこの伸びを構造的に持たない。
+To make "adding agent / service" declarative, the approach is **1 box 1 concern (microservices philosophy) + coordination via standard protocols**. The industry converges on **A2A (agent ↔ agent) + MCP (agent → tool)**; extension becomes "publish Agent Card / register MCP server". A co-resident monolith structurally lacks this growth path.
 
-## 決定 (Accepted)
+## Decision (Accepted)
 
-1. **1 agent 1 box に分解する**。各 box は built-in agent として native 認証する（claude = 経路 C anthropic OAuth secret / codex = openai OAuth secret / 以降の agent も各 native）。**auth.json 転送は廃する**。なお token-in-box の扱いは agent ごとに非対称: codex の openai OAuth secret は proxy 注入で **box にトークンが入らない**（spike #1）が、claude の経路 C は `~/.claude/.credentials.json` が box 内に provision される（[../../sbx/README.md](../../sbx/README.md) の認証節参照）。security トレードオフは下記「残差」参照。
-2. **協調は A2A（agent ↔ agent）を target とする**。各 agent を A2A server に wrap する（Executor が CLI を shell out + Agent Card で capability を広告）。
-3. **非 agent / tool の追加は MCP** を使う（A2A と層が違い排他でない）。現状の playbook が登録する MCP server は `chrome-devtools` のみ（`.mcp.json` 参照）で、Docker MCP Gateway は未導入。Stage 2 で非 agent service を追加する際に Docker MCP Gateway を導入候補とする。
-4. **将来は host 側に Agent Gateway（egress 制御 + discovery の関所）を置く**（target end-state、Stage 3 で実装）。現行 sbx は default-deny + allowlist（anthropic / github / npm / docker 等）+ `gateway.docker.internal:3128` HTTP proxy で egress を制御している（[parallel-hotl-execution.md](parallel-hotl-execution.md) 「検証ゲート」末尾の egress 補足参照）。Stage 1〜2 は現行 allowlist に必要な穴を開けつつ host broker で協調し、mesh が育った Stage 3 で本物の Agent Gateway（agentgateway 等）が egress + discovery を一本化する形に移行する。
-5. **実装は staged**（full-mesh を一度に建てない = YAGNI）:
-   - **Stage 1**: 最小の本物 A2A slice。codex を A2A server 化（`code-review` capability）→ claude / host が A2A client として review task を投げ artifact を受け取る。Agent Card discovery + JSON-RPC task が 2 box 間で通ることを実証する。
-   - **Stage 2**: gemini / grok box を各々 A2A server + Agent Card で足す。非 agent は MCP server を追加。「足す = Agent Card / MCP 登録」が動くことを示す。
-   - **Stage 3**: mesh が育ったら本物の Agent Gateway（agentgateway 等）で egress + discovery を一本化する。
+1. **Decompose into 1 agent 1 box**. Each box authenticates as built-in agent natively (Claude = path C Anthropic OAuth secret / Codex = OpenAI OAuth secret / subsequent agents use their native paths). **Discontinue auth.json transfer**. Token-in-box handling is asymmetric per agent: Codex's OpenAI OAuth secret **does not put token in box** via proxy injection (spike #1), but Claude path C provisions `~/.claude/.credentials.json` in-container (see auth section in [../../sbx/README.md](../../sbx/README.md)). Security tradeoffs detailed under "Residual" below.
+2. **Target A2A (agent ↔ agent) for coordination**. Wrap each agent as A2A server (Executor shell-outs to CLI + advertises capability via Agent Card).
+3. **Use MCP for adding non-agent / tools** (different layer from A2A, not mutually exclusive). Current playbook registers only `chrome-devtools` MCP server (see `.mcp.json`); Docker MCP Gateway not yet deployed. When adding non-agent service in Stage 2, consider Docker MCP Gateway.
+4. **Future: place Agent Gateway on host side (egress control + discovery checkpoint)** (target end-state, implement in Stage 3). Current sbx controls egress with default-deny + allowlist (anthropic / github / npm / docker, etc.) + `gateway.docker.internal:3128` HTTP proxy (see egress note at end of "Verification Gate" in [parallel-hotl-execution.md](parallel-hotl-execution.md)). Stages 1-2 open necessary holes in current allowlist and coordinate via host broker; Stage 3 transitions to real Agent Gateway (agentgateway, etc.) unifying egress + discovery.
+5. **Implementation is staged** (do not build full mesh at once = YAGNI):
+   - **Stage 1**: Minimal real A2A slice. Make Codex an A2A server (`code-review` capability) → Claude / host throw review tasks as A2A clients and receive artifacts. Demonstrate Agent Card discovery + JSON-RPC task works between 2 boxes.
+   - **Stage 2**: Add Gemini / Grok box as A2A server + Agent Card each. Add non-agents as MCP servers. Show "adding = Agent Card / MCP registration" works.
+   - **Stage 3**: Once mesh matures, unify egress + discovery with real Agent Gateway (agentgateway, etc.).
 
-## なぜ A2A か（MCP / host-script との対比）
+## Why A2A (vs MCP / host-script)
 
-- **host-script broker**: 最小だが dynamic discovery / 異種 agent 拡張を持たない。PoC（proto-gateway、下記 spike #4）には使ったが target にはしない。
-- **MCP only**: agent → tool の層。codex を claude の「道具」扱いになり対等な相互レビューには非対称。非 agent service 追加に併用する。
-- **A2A**: peer agent の標準。拡張が宣言的（Agent Card）。教材として最前線を示せる。
+- **host-script broker**: Minimal but lacks dynamic discovery / multi-agent extensibility. Used for PoC (proto-gateway, spike #4 below) but not target.
+- **MCP only**: Agent → tool layer. Treats Codex as Claude's "tool", asymmetric for peer mutual review. Used alongside for non-agent service addition.
+- **A2A**: Standard for peer agents. Extension is declarative (Agent Card). Shows cutting edge to trainees.
 
-## 残差・トレードオフ
+## Residual and tradeoffs
 
-- per-agent の A2A server wrapper を作るコスト（CLI は A2A-native でない）。
-- box-to-box は host 経由 + egress policy で繋ぐ（隔離に governed hole を開ける）。
-- A2A は young spec（churn リスク）。実装は staged にして影響を局所化する。
-- サブスク並列の天井は plan の concurrent session cap（ChatGPT Pro は並列向け価格・ToS 内）。rotation は proxy 注入で box にトークンのコピーを持たないため構造的に回避されるが、持続 refresh の挙動は要観測（spike #2）。
-- **claude 経路 C の token-in-box 残差**: 決定 #1 のとおり claude box には `~/.claude/.credentials.json` が provision されるため、claude box 侵害時に実トークンが exfil されうる（codex の openai OAuth secret は proxy 注入で box 外、こちらだけ非対称に消える）。緩和は claude 側を経路 A（API key proxy 注入）に切り替えれば token-not-in-box にできるが、サブスク維持時は箱内 token を accepted residual とする（[../../sbx/README.md](../../sbx/README.md) の security トレードオフ参照）。
+- Cost of building per-agent A2A server wrapper (CLI is not A2A-native).
+- Box-to-box connectivity via host + egress policy (opens governed hole in isolation).
+- A2A is young spec (churn risk). Implementation staged to localize impact.
+- Subscription parallelism ceiling is plan's concurrent session cap (ChatGPT Pro priced for parallelism, within ToS). Rotation structurally avoids copies in box via proxy injection, but sustained refresh behavior requires observation (spike #2).
+- **Claude path C token-in-box residual**: As per decision #1, `~/.claude/.credentials.json` is provisioned in Claude box; Claude box compromise could exfil real tokens (Codex's OpenAI OAuth secret stays outside box via proxy injection, asymmetrically absent here). Mitigation: switch Claude to path A (API key proxy-injected) for token-not-in-box; with subscription maintained, accept in-box token as residual (see security tradeoff in [../../sbx/README.md](../../sbx/README.md)).
 
-## 検証ゲート (spike) — 結果（2026-06-19 実機検証で通過）
+## Verification Gate (spike) — Results (2026-06-19 passed real-world verification)
 
-macOS arm64 / sbx v0.33.0 / 現行 `sbx/` カスタム image で確認。
+Verified on macOS arm64 / sbx v0.33.0 / current `sbx/` custom image.
 
-1. ✅ **隔離 box で codex の native 認証（転送ゼロ）**: `sbx secret set -g openai --oauth`（global）+ `sbx create --name <box> codex -t coding-agent-playbook-sbx --clone .` で、作成時に `Using stored OpenAI OAuth credentials`、`codex exec` が `provider: sandboxd`（proxy 注入）で応答。**auth.json 転送なし・token は box に入らない**。同居 box の codex 認証摩擦が、codex-base box では解消することを確認。
-2. ✅ **並列**: 2 つの codex-base box で同時に `codex exec` し両方成功（401 なし）。持続 refresh の rotation は未ストレステスト（proxy 注入は box にコピーを持たず構造的に回避される）。
-3. ✅ **隔離 box でローカル環境が建つ**: codex-base box に node v22.x / npm 9.x / Docker 29.x（DinD）。dev server を box 内に立て `sbx ports <box> --publish` で host に公開できる（[parallel-hotl-execution.md](parallel-hotl-execution.md) spike #5 / 名前ルーティングは [../../tools/parallel-dev/box-routing/](../../tools/parallel-dev/box-routing/README.md)）。
-4. ✅ **host 仲介の協調 PoC（A2A の proto 形）**: claude box（経路 C）が関数を生成 → host が `sbx cp` で claude box → host → codex box に中継 → codex box がレビューし実バグ 2 件検出。別 microVM の claude ↔ codex が **native auth のまま host 仲介で相互レビュー**できることを確認。Stage 1 はこの broker を A2A protocol + Agent Card で正式化する。
+1. ✅ **Native Codex auth in isolated box (zero transfer)**: `sbx secret set -g openai --oauth` (global) + `sbx create --name <box> codex -t coding-agent-playbook-sbx --clone .` shows on creation `Using stored OpenAI OAuth credentials`, `codex exec` responds with `provider: sandboxd` (proxy-injected). **No auth.json transfer, token stays outside box**. Confirmed Codex auth friction in co-resident box is resolved in Codex-base box.
+2. ✅ **Parallelism**: `codex exec` simultaneously on 2 Codex-base boxes, both succeed (no 401). Sustained refresh rotation not stress-tested (proxy injection structurally avoids copies in box).
+3. ✅ **Local environment boots in isolated box**: Codex-base box with node v22.x / npm 9.x / Docker 29.x (DinD). Can stand up dev server in-box and expose to host with `sbx ports <box> --publish` (see [parallel-hotl-execution.md](parallel-hotl-execution.md) spike #5; name routing at [../../tools/parallel-dev/box-routing/](../../tools/parallel-dev/box-routing/README.md)).
+4. ✅ **Host-mediated coordination PoC (A2A proto form)**: Claude box (path C) generates function → host relays via `sbx cp` Claude box → host → Codex box → Codex box reviews and detects 2 real bugs. Confirmed Claude ↔ Codex across microVMs **can mutual-review with native auth via host mediation**. Stage 1 formalizes this broker with A2A protocol + Agent Card.
 
 ## Sources
 

@@ -1,83 +1,83 @@
 ---
 name: pr-review-respond
-description: "Handles GitHub PR reviews that bots (Copilot / qodo / codex-connector) and humans POST on a pull request: fetches the unresolved review threads, adjudicates each finding on its merits (fixes valid correctness/security/regression issues, replies with a reason for nice-to-have/rejected ones), and resolves the threads — autonomously, by the agent's own judgment. Distinct from /pr-codex-ci, which is a LOCAL codex second-opinion (claude proactively invokes codex); this one reacts to reviews already posted on the PR. Use after a push when GitHub bots have reviewed, and before merge (the ruleset blocks merge while any thread is unresolved). Mentions: PR の review 対応 / GitHub review を resolve / Copilot や qodo のコメントに対応 / review thread を片付ける."
+description: "Handles GitHub PR reviews that bots (Copilot / qodo / codex-connector) and humans POST on a pull request: fetches the unresolved review threads, adjudicates each finding on its merits (fixes valid correctness/security/regression issues, replies with a reason for nice-to-have/rejected ones), and resolves the threads — autonomously, by the agent's own judgment. Distinct from /pr-codex-ci, which is a LOCAL codex second-opinion (claude proactively invokes codex); this one reacts to reviews already posted on the PR. Use after a push when GitHub bots have reviewed, and before merge (the ruleset blocks merge while any thread is unresolved). Mentions: PR review handling / resolve GitHub review / handle Copilot and qodo comments / clean up review threads."
 ---
 
 # pr-review-respond
 
-GitHub が PR に付ける review（Copilot / qodo / codex-connector 等の bot + 人間）を **agent の判断で全自動**に処理する。
+Fully autonomously processes reviews that GitHub attaches to PR (bot like Copilot / qodo / codex-connector + humans) **by agent's judgment**.
 
-**`/pr-codex-ci` とは別物**: あちらは claude が**ローカルで codex を能動的に呼ぶ** second opinion（findings は claude に返る）。本 skill は **PR に既に post された他者の review** を GitHub から取りに行き、対応して resolve する（reactive、GitHub thread 経由）。
+**Different from `/pr-codex-ci`**: that one has claude **proactively invoke codex locally** for second opinion (findings return to claude). This skill **fetches reviews already posted on PR** from GitHub, responds and resolves (reactive, via GitHub thread).
 
-## いつ使うか
-- PR に push した後、GitHub bot review（Copilot / qodo 等）が付いたとき
-- **merge 前**: ruleset の `required_review_thread_resolution` が未解決 thread で merge をブロックするため（[../../../docs/repo-settings.md](../../../docs/repo-settings.md)）
+## When to use
+- After pushing to PR, when GitHub bot review (Copilot / qodo etc) attaches
+- **Before merge**: ruleset's `required_review_thread_resolution` blocks merge with unresolved threads (see [../../../docs/repo-settings.md](../../../docs/repo-settings.md))
 
-## 引数
-PR 番号。省略時は現在 branch の PR を `gh pr view --json number` で解決する。
+## Arguments
+PR number. If omitted, resolve current branch's PR with `gh pr view --json number`.
 
-## 手順（全 thread が resolved になるまで loop）
+## Procedure (loop until all threads resolved)
 
-1. **owner/repo 解決**: `gh repo view --json nameWithOwner -q .nameWithOwner`（graphql は `{owner}/{repo}` placeholder を使えないため明示値が要る）。
+1. **Resolve owner/repo**: `gh repo view --json nameWithOwner -q .nameWithOwner` (graphql can't use `{owner}/{repo}` placeholder, needs explicit value).
 
-2. **未解決 thread を取得 → あれば即対応・無ければ check 完了で done 判定**: `gh api graphql` で PR の未解決 review thread を一覧する（id / path / line / 各 comment の author・body）:
+2. **Fetch unresolved threads → handle immediately if any, judge done if none**: List PR's unresolved review threads with `gh api graphql` (id / path / line / each comment's author / body):
    ```bash
    gh api graphql -f query='{ repository(owner: "<owner>", name: "<repo>") {
-     pullRequest(number: <PR番号>) { reviewThreads(first: 50) {
+     pullRequest(number: <PR-number>) { reviewThreads(first: 50) {
        pageInfo { hasNextPage endCursor }
        nodes { id isResolved path line comments(first: 20) { nodes { author { login } body } } }
      } } } }'
    ```
-   `isResolved == false` の node だけを対象にする。`pageInfo.hasNextPage == true` なら `after: <endCursor>` で次ページも取得し、**全ページの未解決を集計してから** 0 件判定する（50 を超える PR で取りこぼさない）。コメントが 20 を超える長大 thread は、その thread を個別に追って全文を読んでから判断する。
+   Target only nodes with `isResolved == false`. If `pageInfo.hasNextPage == true`, fetch next page with `after: <endCursor>`, and **tally unresolved across all pages** before judging zero (don't miss any in PRs exceeding 50 threads). For long threads with comments exceeding 20, follow the thread individually and read full context before deciding.
 
-   ### settle 判定（時間待ちでなく「対応優先 + check 完了イベント」）
+   ### Settlement judgment (event-based timing, not time-polling)
 
-   **「N 分 polling して 0 件安定を待つ」時間待ちは持たない。** 理由は 2 つ: (1) 待つ対象にしていた reviewer の多くは **push では re-review しない**（下記「reviewer の push 時挙動」）ため時間待ちが空振りする。(2) **指摘なしの綺麗な review は review コメントを生成しない**（CodeRabbit は commit status を `success` にするだけ）ため、「bot の review コメントを待つ」という primitive 自体が綺麗な reviewer を観測できない。代わりに **未解決があれば待たず捌き、無ければ head の check 完了（イベント）で done 判定する**:
+   **No time-based polling** (e.g., "poll N minutes waiting for 0-count stability"). Two reasons: (1) Most reviewers you'd wait for **don't re-review on push** (see "reviewer push-time behavior" below), so time-waiting is a miss. (2) **Clean reviews without findings don't generate review comments** (CodeRabbit just sets commit status to `success`), so "waiting for bot review comments" as a primitive can't observe clean reviewers. Instead, **handle unresolved immediately if any; if none, judge done via check completion (event)**:
 
-   - **未解決 thread が 1 件でもあれば、待たず手順 3 へ**（採否 → 修正/reply → resolve）。対応後は本手順 2 の先頭へ戻って再取得する（対応中に新着が増えているため＝ pipelining で待ち時間を作業で埋める）。
-   - **未解決 0 件なら done? を check 状態（イベント）で判定**: `gh pr checks <PR番号>` を見る。**ここで check は「reviewer / CI が出揃ったか」の timing 信号としてのみ使う**（pass/fail の merge 可否判定 = CI gate は本 leaf の責務でなく caller orchestrator の責務。下記）。
-     - `pending` / `queued` / `in_progress` が残る → reviewer / CI が**作業中**。terminal 化を待ってから本手順 2 を再実行する（★時間 floor でなく check 状態の遷移を待つ。CodeRabbit は review 中 `pending` → 完了 `success`/`failure` を立てるので、これが「commit status を出す local reviewer の完了」信号になる）。
-       - **leaf-side timeout bound**: caller orchestrator は本 leaf の戻りを待って blocked のため、caller 側の CI 30 分 bound は本 leaf 実行中**発火できない**。よって check 待ちの hang は本 leaf 自身が bound を持つ: **「CI が一度でも terminal に達した時刻」を起点に 30 分** terminal 化が進まない（または最初から永久 pending）なら HOTL escalate（「PR #<num> の check が 30 分以上 terminal 化しません。`gh pr checks <num>` / `gh pr view <num> --web` で確認後、`/pr-review-respond <PR番号>` を再度叩いてください。」）。
-     - 全 check が terminal（`pass` / `fail` / `skipping` / `neutral` のみ、または checks 0 件 = CI 未設定）+ 未解決 0 件 → **reviewer が出揃い thread も clean**。手順 5 へ（structured result を返す。**`fail` の有無＝CI 緑判定は本 leaf でせず caller に委ねる** — caller が leaf 戻り後に自身の CI gate を再確認する。本 leaf の settle 待ちが CI 状態遷移を跨ぎうるため）。
+   - **If even 1 unresolved thread exists, don't wait; proceed to step 3** (decide / fix or reply → resolve). After responding, return to step 2's start and re-fetch (new arrivals may appear while responding = pipelining fills wait time with work).
+   - **If 0 unresolved, judge done? via check state (event)**: Check `gh pr checks <PR-number>`. **Here, check serves only as a timing signal ("have reviewers/CI appeared?")** (pass/fail merge eligibility = CI gate is not this leaf's responsibility but caller orchestrator's).
+     - `pending` / `queued` / `in_progress` remains → reviewer/CI **in progress**. Wait for terminal state, then re-run step 2 (★not a time floor but check state transition. CodeRabbit signals review completion via `pending` → `success`/`failure`, so this is the "commit status reviewer completion" signal).
+       - **Leaf-side timeout bound**: Caller orchestrator is blocked waiting for this leaf's return, so caller's 30-minute CI bound **can't fire during this leaf's execution**. Thus, check-wait hang is bound by this leaf itself: starting from the first time any CI reaches terminal, if no terminal progress for 30 minutes (or perpetually pending), HOTL escalate ("PR #<num> check hasn't reached terminal for 30+ minutes. Verify with `gh pr checks <num>` / `gh pr view <num> --web`, then re-run `/pr-review-respond <PR-number>`").
+     - All checks terminal (`pass` / `fail` / `skipping` / `neutral` only, or 0 checks = CI unset) + 0 unresolved → **reviewers complete, threads clean**. Go to step 5 (return structured result. **Don't judge CI green here**; delegate to caller — caller re-checks its CI gate after this leaf returns. This leaf's settlement wait may cross CI state transitions).
 
-   **reviewer の push 時挙動（「待つ対象」を判断するための前提知識）**:
-   - **CodeRabbit**: push ごとに incremental review + commit status（`pending`→`success`）を立てる → **check 状態が settle 信号として機能する**
-   - **qodo**: デフォルト `handle_push_trigger = false`（`handle_pr_actions = ['opened','reopened','ready_for_review']`）→ **push では re-review しない**（PR open 時のみ）。push 後に待っても来ない
-   - **chatgpt-codex-connector**: 自動 review は PR open / `@codex review` が baseline で push ごとは保証されず、commit status も立てない comment-only → **作業中を観測する信号が無い**
+   **Reviewer push-time behavior (background for "who to wait for" judgment)**:
+   - **CodeRabbit**: Incremental review + commit status (`pending`→`success`) per push → **check state signals settlement**
+   - **qodo**: Default `handle_push_trigger = false` (`handle_pr_actions = ['opened','reopened','ready_for_review']`) → **doesn't re-review on push** (PR open only). No point waiting after push.
+   - **chatgpt-codex-connector**: Auto-review on PR open / `@codex review` is baseline; push-per-review not guaranteed. No commit status, comment-only → **no progress-observable signal**
 
-   **comment-only reviewer の取りこぼし（既知の限界、意図的に許容）**: codex のように check を立てずコメントだけ非同期に投げる reviewer は「作業中」を観測する信号が原理的に無いため、`全 check terminal + 未解決 0` 到達後に遅れて届くコメントは本パスでは拾わない（時間で待たない方針）。これは **merge が人間判断（HOTL）であること + 遅れて届けば新 thread として残り次パス / 人間が捌くこと** を backstop とする（push が baseline trigger でない codex が push 時に来ること自体が稀で、待ちコストに見合わないため）。
+   **Comment-only reviewer tail arrival (known limitation, intentionally tolerated)**: Reviewers without check status, comment-async like codex, have no signal for "in progress", so comments arriving late after `all checks terminal + 0 unresolved` aren't caught here (no time-wait policy). This relies on **merge being human judgment (HOTL) + late arrivals remaining as new threads for next pass / human handling** (codex without push-trigger baseline rarely arrives on push, making wait cost unjustified).
 
-   **未解決 thread が現れたら**手順 3 へ進む（resolve 後に本手順 2 へ戻る）。
+   **When unresolved threads appear**, proceed to step 3 (return to step 2 after resolve).
 
-3. **各 thread を採否判断**（`/pr-codex-ci` の codex findings と同じ基準。**AI 1 体の指摘を独立根拠にしない**）:
-   - 明確な **correctness / security / regression / 既存契約違反** → 採用。修正（Edit → `git add` → `git commit` → `git push`）
-   - **nice-to-have / 将来用の拡張 / 誤検出 / 既に意図的** → 不採用
-   - **機械的に resolve しない**。必ず内容を読んで判断する（merge を通すためだけの rubber-stamp resolve は禁止）
-   - bot が付ける remediation 用の "Agent Prompt"（qodo 等）は参考に留め、採否は自分で決める
+3. **Judge each thread** (same criteria as `/pr-codex-ci`'s codex findings; **don't treat 1 AI's opinion as independent evidence**):
+   - Clear **correctness / security / regression / existing contract violations** → adopt. Fix (Edit → `git add` → `git commit` → `git push`)
+   - **Nice-to-have / future extensions / false positives / already intentional** → reject
+   - **Don't resolve mechanically**. Always read content and decide (rubber-stamping resolve just to merge is prohibited)
+   - Bot-supplied "Agent Prompt" for remediation (qodo, etc.) is reference only; you decide adoption
 
-4. **reply + resolve**: 各 thread に**対応内容**（採用＝修正 commit の要約 / 不採用＝理由）を reply して resolve する:
+4. **Reply + resolve**: Reply to each thread with **response content** (adopt = summary of fix commit / reject = reason), then resolve:
    ```bash
    gh api graphql \
      -F threadId='PRRT_...' \
-     -F body='<対応内容や不採用理由>' \
+     -F body='<response or rejection reason>' \
      -f query='mutation($threadId: ID!, $body: String!) {
        addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) { comment { id } }
        resolveReviewThread(input: {threadId: $threadId}) { thread { isResolved } }
      }'
    ```
-   graphql の mutation は逐次実行だが atomic ではないため、**reply の `comment.id` が返ったことを確認する** — reply が失敗して resolve だけ成功すると audit trail 無しで feedback を隠すので、その時は body を見直して reply を再投稿する。修正を push した場合、新しい push で bot が再 review しうるため、**手順 2 に戻って新たな未解決 thread が無くなるまで繰り返す**。
+   GraphQL mutations execute sequentially but aren't atomic, so **confirm `comment.id` returns from reply** — if reply fails but resolve succeeds, feedback is hidden with no audit trail. If so, review body and repost reply. If you push fixes, new push may trigger bot re-review, so **return to step 2 and repeat until no new unresolved threads**.
 
-5. **完了（structured result を caller に返す）**: 本 skill は **leaf** ([../../../rules/skills.md](../../../rules/skills.md)) のため、上位 orchestrator（典型的には `/pr-codex-ci` 手順 5）を**呼び戻さない**（cycle 回避）。代わりに structured result を返して終了する:
+5. **Complete (return structured result to caller)**: This skill is a **leaf** ([../../../rules/skills.md](../../../rules/skills.md)), so **don't call back** the upper orchestrator (typically `/pr-codex-ci` step 5) (cycle prevention). Return structured result and exit:
 
-   - `pushed_changes: true / false`（手順 3 で code を Edit + commit + push したか）
-   - `resolved_count: N`（本 skill 起動から終了までに resolve した thread 数）
-   - `final_unresolved: 0`（または `> 0` なら HOTL escalate 経路）
-   - `checks_terminal: true`（手順 2 の done 判定で全 check が terminal だった。**個々の check の pass/fail は含めない** — CI 緑判定は caller の責務）
+   - `pushed_changes: true / false` (did you Edit + commit + push code at step 3?)
+   - `resolved_count: N` (number of threads resolved from skill launch to exit)
+   - `final_unresolved: 0` (or `> 0` for HOTL escalate path)
+   - `checks_terminal: true` (all checks reached terminal at step 2's done judgment. **Don't include individual check pass/fail** — CI green judgment is caller's responsibility)
 
-   `pushed_changes: true` の場合、新 SHA は codex/CI 未検証のため caller orchestrator が再評価責務を持つ（`/pr-codex-ci` 手順 5 が `pushed_changes` を見て自身の手順 1 から再起動する）。`pushed_changes: false` の場合も、本 leaf の settle 待ちが CI 状態遷移を跨ぎうるため、**caller は本 leaf の戻り後に自身の CI gate を再確認してから merge-ready 判定する**（leaf は CI 緑を保証しない。詳細は手順 2 の check 判定）。本 skill 単体で呼ばれた（caller orchestrator なし）場合は user に「全 thread resolved。merge 前に CI green を最終確認すること（leaf は CI 緑を判定しない）」と報告して停止する。
+   If `pushed_changes: true`, the new SHA is unverified by codex/CI; caller orchestrator is responsible for re-evaluation (`/pr-codex-ci` step 5 sees `pushed_changes` and restarts from its step 1). If `pushed_changes: false`, this leaf's settlement wait may cross CI state transitions, so **caller must re-check its CI gate after this leaf returns before merge-ready judgment** (leaf doesn't guarantee CI green; see step 2's check judgment). If this skill is called standalone (no caller orchestrator), report to user "all threads resolved; final CI green check before merge (leaf doesn't judge CI green)" and stop.
 
-## 注意
-- **resolve は必ず adjudication の後**。これは「review feedback を rubber-stamp しない」ための核心（GitHub review は他者が PR に書いたものなので、ローカル codex 相談より慎重に扱う）
-- 採否判断は addition bias を避け、correctness / security / regression / 既存契約違反に絞る
-- reviewer 未到達等で reply/resolve が失敗したら、無理に resolve せずユーザーに報告して止まる
-- **leaf 性の保持**: 本 skill から `/pr-codex-ci` / その他 orchestrator を呼ばない。手順 3 の修正 push 後の再評価は **caller 側 orchestrator の責務**（structured result で push 有無を伝えるだけ）
+## Important notes
+- **Resolve always after adjudication**. This is the core of "don't rubber-stamp review feedback" (GitHub reviews are others' writing on the PR, so treat more carefully than local codex consultation)
+- Avoid addition bias in judgment; narrow to correctness / security / regression / existing contract violations
+- If reply/resolve fails (reviewer unreachable, etc.), don't force resolve; report to user and stop
+- **Maintain leaf nature**: don't call `/pr-codex-ci` / other orchestrators from this skill. Re-evaluation after fix push at step 3 is **caller orchestrator's responsibility** (just convey push presence via structured result)
