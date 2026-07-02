@@ -4,16 +4,17 @@
 
 ## 認証 secret の詳細
 
-box 起動時に sbx が自動で box に provision するため、毎回 `/login` / GitHub 認証する必要なし。**secret はグローバルでも box の作成時にのみ provision される**ため、`scripts/dev.sh` で box を立てる前に下記 3 つの secret (anthropic / github / openai) を登録しておく必要がある (後から登録すると box を再作成しないと反映されない)。**API key 経路 / 箱内 /login 経路 / codex サブスク (`~/.codex/auth.json` 転送) 経路の使い分け** は [sbx/README.md](../sbx/README.md) 「認証」セクション参照。
+box 起動時に sbx が secret を box に provision するため、box 内で毎回認証し直す必要はない。**secret はグローバルでも box の作成時にのみ provision される**ため、`scripts/dev.sh` で box を立てる前に **github / openai** を登録しておく (後から登録すると box を再作成しないと反映されない)。**anthropic はサブスク (Pro/Max) なら secret 登録は不要** — 最初の box で `/login` すれば以降の新規 box は自動 provision される (v0.34.0。下記)。**API key 経路 / サブスク `/login` seeding 経路 / codex サブスク (`~/.codex/auth.json` 転送) 経路の使い分け** は [sbx/README.md](../sbx/README.md) 「認証」セクション参照。
 
 ### anthropic (claude を box の中で動かす)
 
+サブスク (Pro/Max) は **最初の box で `/login` するだけ** (v0.34.0)。`/login` の OAuth token を sbx proxy が host store に保持し、以降の新規 box には sentinel credentials が自動 provision される (実トークンは box に入らない)。**secret 登録はしない** — `claude setup-token` を `sbx secret set -g anthropic` すると apikey 型で登録され、box が `SBX_CRED_ANTHROPIC_MODE=apikey` になって `claude -p` が「Invalid API key」で壊れる ([sbx/README.md](../sbx/README.md) 「認証」)。
+
 ```bash
-claude setup-token                         # 長期トークン sk-ant-oat01-... を発行 (host で 1 回)
-sbx secret set -g anthropic                # 表示されたトークンを貼る
+sbx run <box>      # claude 起動後に /login (最初の 1 box だけ。以降は自動 provision)
 ```
 
-長期トークンを発行せず API key 経路で済ませたい場合は、`claude setup-token` の代わりに [sbx/README.md 経路 A](../sbx/README.md#経路-a-api-keyproxy-注入トークンは-box-に入らない) (`sbx secret set -g anthropic` に API key を貼る) に置き換える。この場合 `claude` CLI の host install は省略可。
+API 課金にする / サブスクを持たない場合は API key 経路: [sbx/README.md](../sbx/README.md) 「認証」の「代替: API key」に従い `sbx secret set -g anthropic` に API key (`sk-ant-api...`) を貼る。この場合サブスクの `/login` は不要。
 
 ### github (PR 操作)
 

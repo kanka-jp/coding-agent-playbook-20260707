@@ -15,7 +15,7 @@ sbx template load cap-sbx.tar                          # sbx は local image を
 
 **secret 登録**（box の外で proxy 注入が原則。一部経路で token が box 内に provision される例外あり、security トレードオフは [sbx/README.md](../sbx/README.md)）:
 
-- **claude**: サブスク並列は `claude setup-token` → `sbx secret set -g anthropic`（全 box 自動認証・推奨）。単発は箱内 `/login`。API key は `sbx secret set -g anthropic`
+- **claude**: サブスク (Pro/Max) は **初回にどれか 1 box で `/login` するだけ**（v0.34.0。以降の新規 box は sentinel credentials が自動 provision・token-not-in-box。secret 登録はしない — `setup-token` を `sbx secret set` すると apikey 型で上書きされ `claude -p` が「Invalid API key」で壊れる）。API 課金にするなら API key を `sbx secret set -g anthropic`。詳細は [sbx/README.md](../sbx/README.md)「認証」
 - **codex**: built-in claude agent の同居 box (codex 同梱) は OAuth proxy 注入が効かない (agent-gating) ため、host で `codex login` 済みの `~/.codex/auth.json` を box 内に転送（転送先 dir 事前作成 + `sbx cp` + 所有者変更の 3 ステップ、詳細は [sbx/README.md](../sbx/README.md) の「codex のサブスク認証」）。**built-in codex agent の専用 box (codex reviewer pair = `cdx-<NAME>`)** は `sbx secret set -g openai --oauth` で作成時に proxy 注入（token は box に入らない、auth.json 転送不要）
 
 ## 1. box 起動
