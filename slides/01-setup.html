@@ -55,9 +55,9 @@
 
 ## 前提（host に用意するツール）
 
-- Docker + `sbx` CLI v0.31+（[Docker Sandboxes](https://docs.docker.com/ai/sandboxes/)。`sbx version` で確認）
+- Docker + `sbx` CLI v0.31+（[Docker Sandboxes](https://docs.docker.com/ai/sandboxes/)。`sbx version` で確認。サブスク認証の自動 provision は v0.34.0+）
 - git 2.48+
-- `claude` CLI（`claude setup-token` の長期トークン発行に使用。API key 経路なら省略可）
+- `claude` CLI（host session で claude を回す場合のみ。box 内 claude は image 同梱）
 - 設定は repo に同梱 — **clone するだけで揃う**（個人の `~/.claude` に依存しない）
 
 ---
@@ -66,15 +66,15 @@
 
 - repo を clone（PR フローまで自分で体験するなら **fork** して自分のコピーを clone。fork 時は "Copy the `main` branch only" を**外す** — 講義は `stage/*` ブランチを使う）
 - `sbx login` — Docker アカウント認証
-- secret を 3 種登録（次スライド）
+- secret を 2 種登録（github / openai。次スライド）
 
 ---
 
 ## secret 登録（box を立てる前に）
 
-- anthropic: `sbx secret set -g anthropic`（`claude setup-token` の長期トークン、または API key を貼る）
 - github: fine-grained PAT（対象 repo 限定 / 権限 5 種）→ `sbx secret set -g github`
 - openai: `sbx secret set -g openai --oauth`（browser で ChatGPT 認証）
+- anthropic はサブスク（Pro/Max）なら**登録不要** — 最初の box で `/login` するだけ（v0.34.0。以降の box は自動 provision）。API 課金なら API key を `sbx secret set -g anthropic`（setup-token を登録すると `claude -p` が壊れる — `docs/setup.md`）
 - **後から登録すると box の再作成が必要**（secret は box 作成時にのみ反映）
 - PAT の発行手順・権限の根拠は `docs/setup.md` 参照
 
