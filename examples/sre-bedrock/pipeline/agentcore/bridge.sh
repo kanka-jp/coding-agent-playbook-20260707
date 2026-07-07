@@ -51,16 +51,18 @@ work = sys.argv[2]
 files = {}
 total_bytes = 0
 # 集める対象: apps/*/src/**/*.ts(x) と packages/*/src/**/*.ts。1 ファイル 50KB + 総量 900KB 上限 (agent server の 1MiB request cap に収める)。
+# stage 系 (stacked branches) は product root が app/ 配下にネストするため、repo 直下と app/ 配下の両 layout を受ける。
 exts = (".ts", ".tsx", ".js", ".mjs")
-prefixes = ("apps/", "packages/")
-top_level = ("apps", "packages")  # os.path.relpath は trailing slash を付けないため prefixes とは別に top-level dir 名を許可する
+prefixes = ("apps/", "packages/", "app/apps/", "app/packages/")
+# os.path.relpath は trailing slash を付けないため、prefixes とは別に走査を継続する中間 dir 名 (完全一致) を許可する
+walk_through = ("apps", "packages", "app", "app/apps", "app/packages")
 MAX_TOTAL_BYTES = 900_000
 for root, dirs, names in os.walk(work):
     rel = os.path.relpath(root, work)
     if any(seg in dirs for seg in ("node_modules", ".git", "dist", "build")):
         dirs[:] = [d for d in dirs if d not in ("node_modules", ".git", "dist", "build")]
-    if not (rel == "." or rel in top_level or rel.startswith(prefixes)):
-        dirs[:] = []  # apps/ packages/ 以外の subtree は探索自体を打ち切る (不要 I/O 削減)
+    if not (rel == "." or rel in walk_through or rel.startswith(prefixes)):
+        dirs[:] = []  # 収集対象 (prefixes / walk_through) 以外の subtree は探索自体を打ち切る (不要 I/O 削減)
         continue
     for n in names:
         if not n.endswith(exts):

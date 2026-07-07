@@ -59,4 +59,8 @@ checkpoint は状態の連鎖として並ぶ (✅ = 整備済み):
 
 開催回ごとの受講者配布 repo（`coding-agent-playbook-YYYYMMDD`）へ本 repo の最新を反映する手順は [workshop-sync.md](workshop-sync.md)。snapshot repo は upstream と履歴を共有せず、各ブランチの tree を commit-tree で完全一致させて直接 push する（sync は PR にしない）。
 
+## 講師個人 fork での運営
+
+workshop snapshot repo を講師個人の GitHub アカウントに fork し、そこで実演の準備を進めてそのまま受講者に配布する運用ができる。fork 手順・実演の進め方・受講者への案内は [instructor-fork.md](instructor-fork.md)。
+
 **現状 (2026-07)**: `01`〜`10` の checkpoint がすべて整備済み。運用保守・バグ修正フェーズの local 調査シナリオ (`06`/`07`)、cloud 常駐 fixer シナリオ (`08` + [https://github.com/kanka-jp/coding-agent-playbook/pull/159](https://github.com/kanka-jp/coding-agent-playbook/pull/159))、ログ経由 prompt injection シナリオ (`09`/`10`) が揃っている。残るのは cloud 常駐 fixer の full 配線 (CloudWatch alarm 経由の trigger・Slack 承認通知。[docs/decisions/cloud-unattended-sre.md](../decisions/cloud-unattended-sre.md)「残差・未決」参照)。
