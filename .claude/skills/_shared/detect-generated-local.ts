@@ -183,13 +183,19 @@ async function main() {
   const gaEntries = gaContent !== null ? parseGitattributes(gaContent) : [];
 
   for (const f of files) {
+    // .gitattributes の明示指定は GitHub Linguist の正準シグナルのため name/content 判定より優先する
+    const gaResult = gaEntries.length > 0 ? gitattributesGenerated(f.path, gaEntries) : null;
+    if (gaResult === true) {
+      generated.push({ path: f.path, reason: "gitattributes:linguist-generated" });
+      continue;
+    }
+    if (gaResult === false) {
+      review.push(f.path);
+      continue;
+    }
     const nameReason = classifyByName(f.path);
     if (nameReason) {
       generated.push({ path: f.path, reason: nameReason });
-      continue;
-    }
-    if (gaEntries.length > 0 && gitattributesGenerated(f.path, gaEntries)) {
-      generated.push({ path: f.path, reason: "gitattributes:linguist-generated" });
       continue;
     }
     // 削除は HEAD/index/worktree に内容が無く、名前で拾えなければ review に残す

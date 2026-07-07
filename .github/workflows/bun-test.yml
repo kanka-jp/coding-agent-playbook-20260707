@@ -1,0 +1,15 @@
+# TODO: workflow_dispatch only (private repo の課金回避)。public 化時の enable 手順は .github/workflows/README.md 参照
+name: bun-test
+on:
+  workflow_dispatch:
+jobs:
+  bun-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - name: Run bun test
+        # bun test は既定で hidden directory (`.claude/` 等) を検出しないため、明示パスで渡す
+        run: bun test ./.claude/

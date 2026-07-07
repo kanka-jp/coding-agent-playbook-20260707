@@ -57,7 +57,8 @@ export function classifyByContent(content: string): string | null {
   return null;
 }
 
-export type GitattrEntry = { re: RegExp; generated: boolean };
+// generated: null は `!linguist-generated` によるリセット (unspecified) を表す
+export type GitattrEntry = { re: RegExp; generated: boolean | null };
 
 // common subset の glob のみ対応。変換不能なパターンは null (呼び出し側で skip = 安全側)
 export function gitattrGlobToRegex(pattern: string): RegExp | null {
@@ -114,24 +115,27 @@ export function parseGitattributes(text: string): GitattrEntry[] {
     if (!line || line.startsWith("#")) continue;
     const parts = line.split(/\s+/);
     const pattern = parts[0];
-    let generated: boolean | null = null;
+    // undefined は記述無し (skip)、null は `!linguist-generated` による unspecified へのリセット
+    let generated: boolean | null | undefined;
     for (const attr of parts.slice(1)) {
       if (attr === "linguist-generated" || attr === "linguist-generated=true") {
         generated = true;
       } else if (attr === "-linguist-generated" || attr === "linguist-generated=false") {
         generated = false;
+      } else if (attr === "!linguist-generated") {
+        generated = null;
       }
     }
-    if (generated === null) continue;
+    if (generated === undefined) continue;
     const re = gitattrGlobToRegex(pattern);
     if (re) entries.push({ re, generated });
   }
   return entries;
 }
 
-// gitattributes は後勝ち (最後に一致した行の値が有効)。
-export function gitattributesGenerated(path: string, entries: GitattrEntry[]): boolean {
-  let result = false;
+// gitattributes は後勝ち。該当ルールが無ければ null (false だと明示 opt-out と区別できないため)
+export function gitattributesGenerated(path: string, entries: GitattrEntry[]): boolean | null {
+  let result: boolean | null = null;
   for (const e of entries) {
     if (e.re.test(path)) result = e.generated;
   }

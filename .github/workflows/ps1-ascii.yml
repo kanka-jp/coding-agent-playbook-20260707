@@ -7,6 +7,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Assert .ps1 files are ASCII-only
         # LC_ALL=C でバイト単位マッチ (UTF-8 locale だと grep -P が Shift-JIS 等 invalid-UTF-8 バイトを
         # [^\x00-\x7F] で拾えず本来 fail すべき .ps1 が pass する)。exit >=2 も握り潰さず fail し検査破損を検知。

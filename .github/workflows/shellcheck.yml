@@ -7,6 +7,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Run shellcheck on all tracked *.sh
         # git ls-files で全 .sh を網羅 (素の glob は recurse しない)。末尾 -- で先頭 - のファイル名がオプション誤解釈されるのを防ぐ。
         # --severity=warning は SC2016 (info) を除外: sh -lc '$1' 等の意図的な位置パラメータ渡しへの false-positive のため。
