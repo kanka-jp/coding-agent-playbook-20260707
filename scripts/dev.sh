@@ -1012,13 +1012,6 @@ _route_store_write() { # $1=name, yaml は stdin
     mkdir -p "$dyn"; cat > "$dyn/$1.yml"
   fi
 }
-_route_store_read() { # $1=name -> stdout (無ければ空)
-  if [ -n "$dynvol" ]; then
-    docker run --rm -v "$dynvol":/d "$_route_store_img" sh -c "cat /d/$1.yml 2>/dev/null" 2>/dev/null || true
-  else
-    cat "$dyn/$1.yml" 2>/dev/null || true
-  fi
-}
 _route_store_rm() { # $1=name
   if [ -n "$dynvol" ]; then
     if ! docker run --rm -v "$dynvol":/d "$_route_store_img" rm -f "/d/$1.yml" >/dev/null; then
@@ -1031,15 +1024,45 @@ _route_store_rm() { # $1=name
     fi
   fi
 }
-_route_store_list() { # -> name 一覧 (.yml を除いた basename)。rc: 0=成功 (空 store 含む) / 非0=backend エラー
-  # inner の `; exit 0` は空 store 時に最終 test の rc 1 が docker の rc に化けるのを吸収する
-  # (rc 非0 を backend エラーに限定し、衝突走査側の fail-closed 判定を成立させる)
+# per-route の docker run (O(N)。共有 volume だと数百 route × コンテナ起動で分単位) + per-route の shell
+# fork を、1 回の docker run + 単一 awk pass で回避し、FS(0x1c) 区切り record を stdout に返す。
+# 列: name / lc-name / box / lc-hosts(空白区切り) / url / first-host。区切りが FS (非 whitespace) なのは
+# read で box 等が空でも空フィールドが coalesce されず列がずれないため (tab は whitespace 扱いで潰れる)。
+# 手書き rule の `Host(a) || Host(b)` 複合は全 Host を lc-hosts に集める (最初の1個限定だと衝突走査が漏れる)。
+# 0-byte の .yml は record 化されない (router を持たず衝突を起こさないので除外は安全)。
+# rc: 0=成功 (空 store 含む) / 2=backend エラー (fail-closed 用)。
+_route_store_records() {
+  # 同一 awk program を volume (container 内) と dir (host) の両 backend で使う。
+  local awkprog='
+    function flush() { if (fn != "") print fn "\034" tolower(fn) "\034" bx "\034" hs "\034" ur "\034" fh }
+    FNR==1 { flush(); fn=FILENAME; sub(/.*\//,"",fn); sub(/\.yml$/,"",fn); bx=""; hs=""; ur=""; fh="" }
+    /^# box:/ { if (bx=="") bx=$3 }
+    /url:/ { if (ur=="" && match($0,/"[^"]+"/)) ur=substr($0,RSTART+1,RLENGTH-2) }
+    { s=$0
+      while (match(s,/Host\(`[^`]+`\)/)) {
+        h=substr(s,RSTART+6,RLENGTH-8)
+        if (fh=="") fh=h
+        hs=hs " " tolower(h)
+        s=substr(s,RSTART+RLENGTH)
+      } }
+    END { flush() }'
   if [ -n "$dynvol" ]; then
-    docker run --rm -v "$dynvol":/d "$_route_store_img" sh -c 'for f in /d/*.yml; do [ -e "$f" ] && basename "$f" .yml; done; exit 0' 2>/dev/null
-  else
-    for f in "$dyn"/*.yml; do [ -e "$f" ] && basename "$f" .yml; done 2>/dev/null
-    return 0
+    # volume の読み取りは container 内に閉じる: host tmp へ展開して host awk で読むと volume 内の悪意ある
+    # symlink を host awk が追って host ファイルを読む経路 (box が volume に symlink を植え host 側 route
+    # add/ls に host ファイルを読ませる escalation) になる。旧 per-route も container 内 read だった。glob は
+    # container 側で展開。空 store は awk を呼ばず rc 0、docker/awk 失敗は rc 2 (fail-closed)。
+    if docker run --rm -e AWKPROG="$awkprog" -v "$dynvol":/d "$_route_store_img" \
+         sh -c 'if ls /d/*.yml >/dev/null 2>&1; then awk "$AWKPROG" /d/*.yml; else :; fi'; then
+      return 0
+    fi
+    return 2
   fi
+  # dir backend は host awk (旧 dir 読みと同じ host-side。attacker 共有 volume 経路ではない)。
+  # *.yml が 1 件も無い (glob 未展開) 場合は awk に literal path を渡さず空出力にする。
+  local had=0 f
+  for f in "$dyn"/*.yml; do if [ -e "$f" ]; then had=1; break; fi; done
+  [ "$had" = 1 ] || return 0
+  awk "$awkprog" "$dyn"/*.yml || return 2   # awk の raw rc (1 でありうる) を契約の 2 に正規化
 }
 # 経路の存在確認 + 内容取得。読み取り「失敗」を「不在」に潰さない (潰すと所有/衝突 guard が
 # backend 不調時に素通りして上書きしてしまう)。rc: 0=存在(stdout=内容) / 1=不在 / 2=backend エラー。
@@ -1057,16 +1080,6 @@ _route_store_get() { # $1=name
   else
     if [ -f "$dyn/$1.yml" ]; then cat "$dyn/$1.yml"; return 0; else return 1; fi
   fi
-}
-
-# stdin の yaml から全 Host(`...`) の中身を 1 行ずつ返す (無ければ空)。手書き rule は `Host(a) || Host(b)` の
-# 複合を持ちうるため最初の 1 個に限定しない (衝突走査が 2 個目以降を見逃す)。PathPrefix 等は拾わない。
-_route_rule_host() {
-  awk '{ s = $0
-         while (match(s, /Host\(`[^`]+`\)/)) {
-           print substr(s, RSTART + 6, RLENGTH - 8)
-           s = substr(s, RSTART + RLENGTH)
-         } }'
 }
 
 _route_usage() {
@@ -1200,43 +1213,37 @@ cmd_route() {
       # 典型は旧 default 名 <branch>.<repo> のファイルが Host web.… を持つ upgrade 後の再 add)。
       # 同 box 所有なら置換移行、他 box / 管理外は fail-closed。1st pass は検出のみで削除しない
       # (走査途中で削除すると、後続で fail-closed になった場合に旧経路だけ消える部分破壊が起きる)。
-      # 一覧取得も fail-closed (backend エラーで空一覧に潰れると走査自体が素通りする)
-      local others
-      others=$(_route_store_list) \
-        || { echo "error: 経路ストアの一覧を取得できません（backend エラー）。安全のため中断します。" >&2; exit 1; }
-      local other other_lc ocontent ohosts obox orc conflict migrate=""
-      for other in $others; do
+      # 全 route を record 化 (_route_store_records) して fork なしの bash ループで判定する。取得失敗は
+      # fail-closed (空一覧に潰すと走査が素通りして同一 Host の router 重複を書く)。
+      local records
+      records=$(_route_store_records) \
+        || { echo "error: 経路ストアの取得に失敗（backend エラー）。安全のため中断します。" >&2; exit 1; }
+      # 各 record の値は _route_store_records 側で lower-case 済み ($name も add 冒頭で lower-case 済み)。
+      # here-doc (パイプでなく) で現シェルの migrate 蓄積 / exit を効かせる。
+      local other other_lc obox ohosts conflict migrate="" _url _fhost
+      while IFS=$'\034' read -r other other_lc obox ohosts _url _fhost; do
+        [ -z "$other" ] && continue
         [ "$other" = "$name" ] && continue
-        # fail-closed reader (_route_store_get) を使う: read 失敗を「不在」に潰すと同一 Host の
-        # 衝突検出が transient エラーで素通りし router 重複を書いてしまう
-        orc=0; ocontent=$(_route_store_get "$other") || orc=$?
-        if [ "$orc" = 2 ]; then
-          echo "error: 経路ストアを確認できません（'$other' の読み取りで backend エラー）。安全のため中断します。" >&2; exit 1
-        fi
-        [ "$orc" = 0 ] || continue
         # 衝突 = 同一 Host を持つ entry、または basename が case 違いで一致する entry
         # (hostname は case-insensitive。case 違い basename を無検査 skip すると、別 box 所有 entry の
         # fail-closed guard を bypass して同一 hostname の router 重複を書けてしまう)
         conflict=0
-        other_lc=$(printf '%s' "$other" | tr '[:upper:]' '[:lower:]')
         [ "$other_lc" = "$name" ] && conflict=1
         if [ "$conflict" = 0 ]; then
-          # membership 照合は全読みの command substitution + case で行う (`| grep -q` は match 時の早期 close で
-          # 上流 awk が SIGPIPE 141 になり pipefail 下で「一致したのに不一致」の偽陰性を生む)
-          ohosts=$(printf '%s' "$ocontent" | _route_rule_host | tr '[:upper:]' '[:lower:]')
-          case $'\n'"$ohosts"$'\n' in
-            *$'\n'"$name.localhost"$'\n'*) conflict=1 ;;
+          case " $ohosts " in
+            *" $name.localhost "*) conflict=1 ;;
           esac
         fi
         [ "$conflict" = 1 ] || continue
-        obox=$(printf '%s' "$ocontent" | awk '/^# box:/{print $3; exit}')
         if [ "$obox" = "$box" ]; then
           migrate="$migrate $other"
         else
           echo "error: Host '$name.localhost' は既存経路 '$other' (box='${obox:-unknown}') が使用中。上書きしません。" >&2
           exit 1
         fi
-      done
+      done <<EOF
+$records
+EOF
       local route_yaml
       route_yaml=$(cat <<EOF
 # box: $box
@@ -1256,7 +1263,7 @@ EOF
       printf '%s\n' "$route_yaml" | _route_store_write "$name"
       # 旧経路の削除は新経路の write 成功後 (write が transient 失敗すると旧経路まで失い無経路になる。
       # 一時的な同一 Host 重複は同 box・同 hostport で無害、rm 失敗時も次回 add の走査が再移行して冪等)
-      local occheck
+      local occheck orc
       for other in $migrate; do
         # case-insensitive FS では case 違い basename が今書いた新経路と同一ファイルでありうる。
         # 内容を再読して新経路そのもの (今書いた yaml) なら削除しない (消すと新経路ごと消える)
@@ -1297,17 +1304,19 @@ EOF
       echo "unrouted: $name (publish は残る。完全に外すなら sbx ports <box> --unpublish)"
       ;;
     ls)
-      # hostname は name から再構築せず yaml の実 rule を読む (store には手書き/旧形式の経路もあり name と一致するとは限らない)
-      local found=0 n c u h
-      for n in $(_route_store_list); do
+      # hostname は name から再構築せず record の実 rule 由来 (first-host) を使う (store には手書き/旧形式の
+      # 経路もあり name と一致するとは限らない)。add の走査と同じく 1 回の docker run + 1 回の awk で record 化する。
+      local records
+      records=$(_route_store_records) \
+        || { echo "error: 経路ストアの取得に失敗（backend エラー）。" >&2; exit 1; }
+      local found=0 n u h _lc _box _hosts
+      while IFS=$'\034' read -r n _lc _box _hosts u h; do
+        [ -z "$n" ] && continue
         found=1
-        c=$(_route_store_read "$n")
-        u=$(printf '%s' "$c" | awk -F'"' '/url:/ {print $2; exit}')
-        # awk 'NR == 1' は入力を最後まで読む (head -n 1 の早期 close だと multi-Host entry で上流が SIGPIPE 141
-        # になり set -e が ls を中断する)
-        h=$(printf '%s' "$c" | _route_rule_host | awk 'NR == 1')
         echo "http://${h:-$n.localhost} -> $u"
-      done
+      done <<EOF
+$records
+EOF
       [ "$found" = 1 ] || echo "(経路なし)"
       ;;
     down)

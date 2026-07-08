@@ -1090,10 +1090,6 @@ function Set-RouteStoreEntry { param($Name, $Content, $Dynvol, $Dyn)
     Set-Content -LiteralPath "$Dyn/$Name.yml" -Value $Content -Encoding UTF8 -ErrorAction Stop
   }
 }
-function Read-RouteStoreEntry { param($Name, $Dynvol, $Dyn)
-  if ($Dynvol) { docker run --rm -v "${Dynvol}:/d" $RouteStoreImg sh -c "cat /d/$Name.yml 2>/dev/null" 2>$null }
-  else { if (Test-Path -LiteralPath "$Dyn/$Name.yml") { Get-Content -Raw -LiteralPath "$Dyn/$Name.yml" } }
-}
 function Remove-RouteStoreEntry { param($Name, $Dynvol, $Dyn)
   if ($Dynvol) {
     docker run --rm -v "${Dynvol}:/d" $RouteStoreImg rm -f "/d/$Name.yml" | Out-Null
@@ -1110,23 +1106,57 @@ function Remove-RouteStoreEntry { param($Name, $Dynvol, $Dyn)
     }
   }
 }
-# Returns @{ rc; names }; rc: 0=success (incl. empty store) / 2=backend error. The inner '; exit 0'
-# keeps a final failed test on an empty store from surfacing as docker's rc, so nonzero rc means
-# backend error only (the conflict scan relies on that for its fail-closed decision).
-function Get-RouteStoreNames { param($Dynvol, $Dyn)
+# All routes in one docker run (avoids per-route docker run O(N): a shared volume with hundreds of
+# foreign routes otherwise starts hundreds of containers = minutes). Returns @{ rc; map } where map is
+# name -> raw content. rc: 0=success (incl. empty store) / 2=backend error (the conflict scan relies on
+# that for its fail-closed decision). Volume mode emits "<name> <base64(content)>" text lines: base64
+# keeps it single-line and delimiter-safe, and stays ASCII through the PS pipeline (a raw tar/binary
+# pipe would be corrupted by PowerShell 5.1 stream encoding).
+function Get-RouteStoreBulk { param($Dynvol, $Dyn)
+  # Ordinal (case-sensitive) keys: a case-sensitive store (Linux volume / dir) can hold both api.yml and
+  # Api.yml; the default @{} hashtable is case-insensitive and would collapse them, dropping one entry and
+  # letting the conflict scan miss it (fail-open). The old name-list preserved both.
+  $map = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::Ordinal)
   if ($Dynvol) {
-    $n = docker run --rm -v "${Dynvol}:/d" $RouteStoreImg sh -c 'for f in /d/*.yml; do [ -e "$f" ] && basename "$f" .yml; done; exit 0' 2>$null
-    if ($LASTEXITCODE -ne 0) { return @{ rc = 2; names = @() } }
-    return @{ rc = 0; names = @($n | Where-Object { $_ }) }
-  } else {
-    # Missing dir = empty store (rc 0); a real listing failure must surface as rc 2, not an empty list
-    # (an empty-looking store would let the Host-conflict scan proceed unchecked).
-    if (-not (Test-Path -LiteralPath $Dyn)) { return @{ rc = 0; names = @() } }
+    # Emit "<base64(name)> <base64(content)>": base64 both so the space delimiter stays unambiguous even when
+    # a foreign/hand-written .yml basename contains spaces (a plain "name b64" split on the first space would
+    # mis-parse it). `|| exit 2` so an unreadable/failed base64 fails-closed (rc 2) instead of a bare
+    # `base64 | tr` pipeline masking the failure via tr's exit status.
+    $lines = docker run --rm -v "${Dynvol}:/d" $RouteStoreImg sh -c 'for f in /d/*.yml; do [ -e "$f" ] || continue; n=${f#/d/}; n=${n%.yml}; nb=$(printf "%s" "$n" | base64 | tr -d "\n") || exit 2; b=$(base64 "$f") || exit 2; printf "%s " "$nb"; printf "%s" "$b" | tr -d "\n"; printf "\n"; done' 2>$null
+    if ($LASTEXITCODE -ne 0) { return @{ rc = 2; map = @{} } }
     try {
-      return @{ rc = 0; names = @(Get-ChildItem -LiteralPath $Dyn -Filter *.yml -File -ErrorAction Stop | ForEach-Object { $_.BaseName }) }
+      foreach ($ln in @($lines)) {
+        if (-not $ln) { continue }
+        $sp = $ln.IndexOf(' ')
+        if ($sp -lt 1) { throw 'malformed bulk record line' }   # non-empty but unsplittable -> fail-closed
+        $n = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($ln.Substring(0, $sp)))
+        $b64 = $ln.Substring($sp + 1)
+        # Skip empty (0-byte) files: no router -> cannot cause a duplicate-router conflict, and dropping
+        # them keeps ls/scan behavior identical to the bash awk (which skips 0-byte files too).
+        if ($b64) { $map[$n] = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64)) }
+      }
     } catch {
-      return @{ rc = 2; names = @() }
+      # A malformed/failed decode is a backend error, not "no such route" (silently dropping a route would
+      # let the Host-conflict scan miss it and write a duplicate router).
+      return @{ rc = 2; map = @{} }
     }
+    return @{ rc = 0; map = $map }
+  } else {
+    # Missing dir = empty store (rc 0); a real read failure must surface as rc 2, not an empty map
+    # (an empty-looking store would let the Host-conflict scan proceed unchecked).
+    if (-not (Test-Path -LiteralPath $Dyn)) { return @{ rc = 0; map = $map } }
+    try {
+      foreach ($fi in @(Get-ChildItem -LiteralPath $Dyn -Filter *.yml -File -ErrorAction Stop)) {
+        # -ErrorAction Stop so a non-terminating read error becomes terminating (caught below -> rc 2)
+        # instead of storing $null and letting the conflict scan skip that route. Empty (0-byte) files read
+        # as $null and are skipped (no router -> no conflict; matches the bash awk).
+        $c = Get-Content -Raw -LiteralPath $fi.FullName -ErrorAction Stop
+        if ($c) { $map[$fi.BaseName] = $c }
+      }
+    } catch {
+      return @{ rc = 2; map = @{} }
+    }
+    return @{ rc = 0; map = $map }
   }
 }
 # Existence + content. Does NOT collapse read errors into "absent" (that would let the ownership/
@@ -1259,17 +1289,14 @@ function Invoke-Route {
       # for one Host; typical case: an old default-name <branch>.<repo> file carrying Host web.... re-added
       # after upgrade). Same-box entries migrate (replace); other boxes / unmanaged entries fail closed.
       # 1st pass only detects (deleting mid-scan would destroy the old route when a later entry fails closed).
-      # Listing is fail-closed too (a backend error collapsing into an empty list would skip the scan entirely).
-      $ol = Get-RouteStoreNames -Dynvol $dynvol -Dyn $dyn
-      if ($ol.rc -ne 0) { Write-Error "cannot list route store (backend error); aborting."; exit 1 }
+      # The bulk read is fail-closed too (a backend error collapsing into an empty map would skip the scan entirely).
+      $bulk = Get-RouteStoreBulk -Dynvol $dynvol -Dyn $dyn
+      if ($bulk.rc -ne 0) { Write-Error "cannot read route store (backend error); aborting."; exit 1 }
       $migrate = @()
-      foreach ($o in $ol.names) {
+      foreach ($o in $bulk.map.Keys) {
         if ($o -ceq $Name) { continue }
-        # Fail-closed reader: collapsing a backend read error into "absent" would let the Host-conflict
-        # guard pass on a transient failure and write a duplicate router.
-        $og = Get-RouteStoreEntry -Name $o -Dynvol $dynvol -Dyn $dyn
-        if ($og.rc -eq 2) { Write-Error "cannot verify route store entry '$o' (backend error); aborting."; exit 1 }
-        if ($og.rc -ne 0 -or -not $og.content) { continue }
+        $oc = $bulk.map[$o]
+        if (-not $oc) { continue }
         # Conflict = an entry carrying the same Host, or a case-variant basename (hostnames are
         # case-insensitive; skipping a case-variant unchecked would bypass the ownership guard for a
         # foreign entry with the same effective hostname).
@@ -1277,12 +1304,12 @@ function Invoke-Route {
         if (-not $conflict) {
           # Check every Host matcher (hand-written rules may combine hosts with ||; matching only the
           # first one would let the conflict scan miss the rest).
-          foreach ($m in [regex]::Matches($og.content, 'Host\(`([^`]+)`\)')) {
+          foreach ($m in [regex]::Matches($oc, 'Host\(`([^`]+)`\)')) {
             if ($m.Groups[1].Value -eq "$Name.localhost") { $conflict = $true; break }
           }
         }
         if (-not $conflict) { continue }
-        $obox = ""; $obm = [regex]::Match($og.content, '(?m)^# box:\s*(\S+)'); if ($obm.Success) { $obox = $obm.Groups[1].Value }
+        $obox = ""; $obm = [regex]::Match($oc, '(?m)^# box:\s*(\S+)'); if ($obm.Success) { $obox = $obm.Groups[1].Value }
         if ($obox -ceq $Box) {
           $migrate += $o
         } else {
@@ -1337,10 +1364,11 @@ http:
       Write-Host "unrouted: $TargetName (publish remains; fully remove with sbx ports <box> --unpublish)"
     }
     "ls" {
-      $names = (Get-RouteStoreNames -Dynvol $dynvol -Dyn $dyn).names
-      if ($names) {
-        foreach ($n in $names) {
-          $c = Read-RouteStoreEntry -Name $n -Dynvol $dynvol -Dyn $dyn
+      $bulk = Get-RouteStoreBulk -Dynvol $dynvol -Dyn $dyn
+      if ($bulk.rc -ne 0) { Write-Error "cannot read route store (backend error)."; exit 1 }
+      if ($bulk.map.Count -gt 0) {
+        foreach ($n in ($bulk.map.Keys | Sort-Object)) {
+          $c = $bulk.map[$n]
           $u = ""; $h = ""
           if ($c) {
             $um = [regex]::Match($c, 'url:\s*"([^"]+)"'); if ($um.Success) { $u = $um.Groups[1].Value }
